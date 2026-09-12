@@ -213,7 +213,7 @@
                         pplBypassName = @"SPTM Bypass";
                     }
 
-                    PSSpecifier *pplBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(pplBypassName) target:self set:defSetter get:expGetter detail:nil cell:PSLinkListCell edit:nil];
+                    PSSpecifier *pplBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(pplBypassName) target:self set:defSetter get:defGetter detail:nil cell:PSLinkListCell edit:nil];
                     [pplBypassSpecifier setProperty:@YES forKey:@"enabled"];
                     [pplBypassSpecifier setProperty:exploitManager.preferredPPLBypass.identifier forKey:@"default"];
                     pplBypassSpecifier.detailControllerClass = [DOPSExploitListItemsController class];

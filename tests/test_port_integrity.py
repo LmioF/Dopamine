@@ -128,6 +128,20 @@ class PortIntegrityTests(unittest.TestCase):
             owners = [path.name for path in sources if definition.search(path.read_text())]
             self.assertEqual(owners, ["main.S"], f"Duplicate trampoline: {symbol}")
 
+    def test_exploit_settings_use_the_declared_preference_getter(self):
+        source = (ROOT / "Application/Dopamine/UI/Settings/DOSettingsController.m").read_text()
+        self.assertIn("SEL defGetter = @selector(readPreferenceValue:);", source)
+        for specifier in ("kernelExploitSpecifier", "pacBypassSpecifier", "pplBypassSpecifier"):
+            declaration = re.search(rf"PSSpecifier \*{specifier} = ([^\n]+);", source)
+            self.assertIsNotNone(declaration, specifier)
+            self.assertIn("get:defGetter", declaration.group(1))
+
+    def test_bundled_palera1n_is_not_marked_as_shared_cache_eligible(self):
+        makefile = (ROOT / "Application/Dopamine/Exploits/palera1n/Makefile").read_text()
+        flags = re.search(r"^palera1n_LDFLAGS\s*=\s*(.+)$", makefile, re.MULTILINE)
+        self.assertIsNotNone(flags)
+        self.assertIn("-Wl,-not_for_dyld_shared_cache", flags.group(1).split())
+
     def test_default_package_excludes_unported_standalone_installer(self):
         result = subprocess.run(
             ["make", "-n", "all", "MAKE=echo", "BUILD_STANDALONE=0"],
