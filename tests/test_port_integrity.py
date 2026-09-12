@@ -142,6 +142,16 @@ class PortIntegrityTests(unittest.TestCase):
         self.assertIsNotNone(flags)
         self.assertIn("-Wl,-not_for_dyld_shared_cache", flags.group(1).split())
 
+    def test_application_recursion_preserves_selected_make(self):
+        for target, operation in (("all", "package"), ("clean", "clean")):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["make", "-n", target, "MAKE=echo"],
+                    cwd=ROOT / "Application", text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"echo -C Dopamine/Exploits/palera1n {operation}", result.stdout)
+
     def test_default_package_excludes_unported_standalone_installer(self):
         result = subprocess.run(
             ["make", "-n", "all", "MAKE=echo", "BUILD_STANDALONE=0"],

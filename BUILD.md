@@ -20,10 +20,15 @@ jailbreaking or hiding on a physical device.
 ## Local prerequisites
 
 Use macOS with Xcode and its iPhoneOS SDK selected by `xcode-select`, the
-roothide fork of Theos with its iPhoneOS 16.5 SDK, GNU Make, `ldid`,
-`trustcache`, and Homebrew `libarchive`. The Xcode SDK is used for the native
-base binaries; the Theos SDK is used for the Theos projects. Do not delete or
-replace Xcode's XPC headers to build this port.
+roothide fork of Theos, GNU Make 4.x, Procursus `ldid`, `trustcache`, and
+Homebrew `libarchive`. The workflow installs the Theos iPhoneOS 16.5 SDK;
+targets selecting `latest` may use a newer SDK available on the host. Do not
+delete or replace Xcode's XPC headers to build this port.
+
+Use the Procursus signing tool, tested with `v2.1.5-procursus7`. The original
+Saurik `ldid` 2.1.5, including Homebrew's `ldid` formula, does not support the
+bundle-level `ldid -s` operation used by packaging. A project-local copy on
+`PATH` is sufficient; replacing the host's default installation is not needed.
 
 The dependency installation steps are in
 [the workflow](.github/workflows/roothide.yml). Point `THEOS` at the installed
@@ -65,9 +70,11 @@ harness on every run. Without an explicit kernelcache argument, it reports
 that kernel-fixture execution was skipped.
 
 The suite also verifies XPC reply return-ownership types with and without
-ARC, timestamp-preserving header staging, and exclusion of the unported
-standalone installer. Theos uses a project-local module cache and validates
-system headers so SDK overlays cannot reuse another build's Clang modules.
+ARC, the ANE relocation record's SDK compatibility and layout,
+timestamp-preserving header staging, recursive Make selection, and exclusion
+of the unported standalone installer. Theos uses a project-local module cache
+and validates system headers so SDK overlays cannot reuse another build's
+Clang modules.
 
 The kernel harness initializes upstream XPF and resolves the additional
 roothide name-cache and AMFI sysctl fields. It does not execute a kernel
