@@ -22,6 +22,9 @@ for ownership in -fobjc-arc -fno-objc-arc; do
 done
 printf '%s\n' 'XPC return-ownership checks passed with and without ARC.'
 
+"$CC" -isysroot "$SDK" -fblocks -fsyntax-only -Werror tests/ane_header_tests.m
+printf '%s\n' 'ANE relocation header compatibility and layout checks passed.'
+
 "${MAKE:-make}" -C BaseBin/XPF output/macos/libxpf.dylib CHOMA_PATH=../ChOma
 export DYLD_LIBRARY_PATH="$ROOT/BaseBin/XPF/output/macos${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
