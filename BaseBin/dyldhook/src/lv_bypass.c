@@ -176,8 +176,15 @@ int HOOK(__fcntl)(int fd, int cmd, void *arg1, void *arg2, void *arg3, void *arg
 	if (jbinfo_is_checked_in() || proc_has_bootstrap_port()) {
 		switch (cmd) {
 			case F_ADDSIGS:
+				if (!jbinfo_should_force_cs_adhoc()) break;
+				__attribute__((fallthrough));
 			case F_ADDFILESIGS:
+			case F_ADDFILESIGS_INFO:
 			case F_ADDFILESIGS_RETURN: {
+				if (cmd != F_ADDSIGS) {
+					int result = (int)msyscall_errno(0x5C, fd, cmd, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+					if (result == 0 || !jbinfo_is_checked_in()) return result;
+				}
 				struct siginfo siginfo;
 				siginfo.source = (cmd == F_ADDSIGS) ? SIGNATURE_SOURCE_PROC : SIGNATURE_SOURCE_FILE;
 				if (arg1) {
@@ -190,7 +197,7 @@ int HOOK(__fcntl)(int fd, int cmd, void *arg1, void *arg2, void *arg3, void *arg
 						bool isFinished = false;
 						int r = 0;
 
-						bool isFile = (cmd == F_ADDFILESIGS || cmd == F_ADDFILESIGS_RETURN);
+						bool isFile = (cmd != F_ADDSIGS);
 						bool superblobNeedsFree = false;
 
 						CS_SuperBlob *superblob = NULL;

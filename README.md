@@ -1,9 +1,28 @@
-<img src="https://github.com/opa334/Dopamine/assets/52459150/ed04dd3e-d879-456d-9aa3-d4ed44819c7e" width="64" />
+# roothide Dopamine 3 (experimental port)
 
-# Dopamine
+This development branch integrates [roothide 2.4.9.27](https://github.com/roothide/Dopamine2-roothide/tree/3824f2731275423c970ff6ed6685957dec269073)
+with [Dopamine 3.x](https://github.com/opa334/Dopamine/tree/939a3a21400f0dc6d6163b2b5999ba2ace0d2732), based on Dopamine 3.0.9.
+It is not an official release from either upstream project.
 
-A rootless semi-untethered jailbreak for iOS 15.0 - 17.3.1 (arm64e), iOS 15.0 - 18.7.1, 26.0 - 26.0.1 (A12/A13) and iOS 15.0 - 18.7.1 (arm64). More details will follow here soon.
+## Compatibility
 
-Please note that all issues related to version support will be deleted without response.
+The port retains Dopamine 3's exploit implementations and device/version selection.
+In particular, upstream supports iPhone 11 on iOS 26.0 and 26.0.1; this does not mean
+that every iOS 26 release is supported. See the [upstream compatibility information](https://ellekit.space/dopamine/).
 
-Official website / download: https://ellekit.space/dopamine/
+**The roothide integration has not been validated on a physical iPhone.** A successful
+build or host-side test does not establish that jailbreak activation, a userspace
+reboot, tweak injection, or jailbreak hiding works on a given firmware. Do not treat
+this branch as a device-tested release.
+
+## Building and testing
+
+See [BUILD.md](BUILD.md) for build instructions and validation boundaries.
+The [GitHub Actions workflow](.github/workflows/roothide.yml) builds the checked-out
+branch, rather than cloning and building the old roothide release.
+
+## Upstream resources
+
+- [Roothide developer documentation](https://github.com/roothide/Developer)
+- [Roothide support](https://twitter.com/roothideDev)
+- [Roothide Discord](https://discord.gg/ZvY2Yjw8GA)

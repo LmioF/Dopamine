@@ -1,0 +1,172 @@
+import pathlib
+import re
+import subprocess
+import tempfile
+import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+UPSTREAM_REVISION = "939a3a21400f0dc6d6163b2b5999ba2ace0d2732"
+
+
+def git(*args: str) -> bytes:
+    return subprocess.run(
+        ["git", *args], cwd=ROOT, check=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+
+
+class PortIntegrityTests(unittest.TestCase):
+    """Source integration checks; these do not establish on-device correctness."""
+
+    def test_upstream_exploit_implementations_are_preserved(self):
+        prefixes = (
+            "Application/Dopamine/Exploits/ClearSword/",
+            "Application/Dopamine/Exploits/DarkSword/",
+            "Application/Dopamine/Exploits/Titan/",
+            "Application/Dopamine/Exploits/momentarius/",
+        )
+        paths = git("ls-tree", "-r", "--name-only", UPSTREAM_REVISION, *prefixes)
+        self.assertTrue(paths, "The pinned Dopamine 3 sources must be available")
+        for path in paths.decode().splitlines():
+            with self.subTest(path=path):
+                file = ROOT / path
+                self.assertTrue(file.is_file(), f"Missing upstream component: {path}")
+                self.assertEqual(file.read_bytes(), git("show", f"{UPSTREAM_REVISION}:{path}"))
+
+    def test_upstream_kernel_compatibility_is_preserved(self):
+        paths = (
+            "BaseBin/libjailbreak/src/info.c",
+            "BaseBin/libjailbreak/src/kernel.c",
+            "BaseBin/libjailbreak/src/kernel.h",
+            "BaseBin/libjailbreak/src/translation.c",
+            "BaseBin/libjailbreak/src/physrw.c",
+            "BaseBin/libjailbreak/src/physrw_pte.c",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual((ROOT / path).read_bytes(), git("show", f"{UPSTREAM_REVISION}:{path}"))
+
+    def test_upstream_serialized_fields_are_preserved(self):
+        path = "BaseBin/libjailbreak/src/info.h"
+        field = re.compile(r"iterator\(ctx,\s*([\w.]+)\)")
+        upstream = set(field.findall(git("show", f"{UPSTREAM_REVISION}:{path}").decode()))
+        current = set(field.findall((ROOT / path).read_text()))
+        self.assertTrue(upstream)
+        self.assertEqual(upstream - current, set(), "Upstream state must survive IPC serialization")
+        self.assertIn("jailbreakInfo.jbrand", current)
+        self.assertIn("kernelSymbol.nchashtbl", current)
+
+    def test_server_domains_preserve_roothide_client_abi(self):
+        header = (ROOT / "BaseBin/libjailbreak/src/jbserver_domains.h").read_text()
+        domains = dict(re.findall(r"#define\s+(JBS_DOMAIN_\w+)\s+(\d+)\b", header))
+        self.assertEqual(len(domains), len(set(domains.values())), "IPC domains must not collide")
+        self.assertEqual(domains["JBS_DOMAIN_ROOTHIDE"], "5")
+        self.assertEqual(domains["JBS_DOMAIN_DOPAMINE"], "6")
+        server = (ROOT / "BaseBin/launchdhook/src/jbserver/jbserver_global.c").read_text()
+        implementations = re.findall(r"&(g\w+Domain)\s*,", server)
+        self.assertEqual(implementations[4:6], ["gRootHideDomain", "gDopamineDomain"])
+
+    def test_upstream_submodule_revisions_are_preserved(self):
+        for path in ("BaseBin/ChOma", "BaseBin/XPF", "BaseBin/opainject", "BaseBin/_external/modules/litehook"):
+            with self.subTest(path=path):
+                expected = git("rev-parse", f"{UPSTREAM_REVISION}:{path}").strip()
+                actual = git("-C", path, "rev-parse", "HEAD").strip()
+                self.assertEqual(actual, expected)
+
+    def test_no_unresolved_merge_markers(self):
+        paths = git("ls-files", "-z").decode().split("\0")
+        marker = re.compile(rb"^(?:<<<<<<< |=======\r?$|>>>>>>> )", re.MULTILINE)
+        for path in filter(None, paths):
+            file = ROOT / path
+            if not file.is_file():
+                continue
+            content = file.read_bytes()
+            if b"\0" in content:
+                continue
+            with self.subTest(path=path):
+                self.assertIsNone(marker.search(content), f"Unresolved merge in {path}")
+
+    def test_build_workflow_uses_the_requested_checkout(self):
+        workflow = (ROOT / ".github/workflows/roothide.yml").read_text()
+        self.assertNotIn("git clone --recursive https://github.com/roothide/Dopamine2-roothide", workflow)
+        self.assertRegex(workflow, r"uses:\s*actions/checkout@")
+
+    def test_build_workflow_does_not_modify_xcode_sdk(self):
+        workflow = (ROOT / ".github/workflows/roothide.yml").read_text()
+        self.assertNotRegex(workflow, r"rm\s+-rf\s+\$\(xcrun")
+
+    def test_ci_runs_host_regressions_with_full_history(self):
+        workflow = (ROOT / ".github/workflows/roothide.yml").read_text()
+        self.assertRegex(workflow, r"fetch-depth:\s*0\b")
+        self.assertIn("sh tests/run_host_tests.sh", workflow)
+
+    def test_workflow_curl_ignores_local_configuration(self):
+        workflow = (ROOT / ".github/workflows/roothide.yml").read_text()
+        commands = re.findall(r"^\s*curl\s+(.+)$", workflow, re.MULTILINE)
+        self.assertTrue(commands)
+        for arguments in commands:
+            self.assertTrue(arguments.startswith("-q "), arguments)
+
+    def test_libjailbreak_compiles_translation_units_independently(self):
+        result = subprocess.run(
+            ["make", "-n", "-B", "objects", "BUILD_STANDALONE=0"],
+            cwd=ROOT / "BaseBin/libjailbreak", text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for architecture in ("arm64", "arm64e"):
+            for source in ("src/info.c", "src/util.m", "src/roothider/code_signing.c", "src/roothider/blacklist.cpp"):
+                self.assertRegex(
+                    result.stdout,
+                    rf"-arch {architecture}\b[^\n]*-c {re.escape(source)} -o ",
+                )
+
+    def test_dyld_string_trampolines_have_one_definition(self):
+        sources = list((ROOT / "BaseBin/dyldhook/src").glob("*.S"))
+        for symbol in ("strlcpy", "strlcat"):
+            definition = re.compile(rf"^\s*MAKE_TRAMPOLINE\({symbol}\)", re.MULTILINE)
+            owners = [path.name for path in sources if definition.search(path.read_text())]
+            self.assertEqual(owners, ["main.S"], f"Duplicate trampoline: {symbol}")
+
+    def test_default_package_excludes_unported_standalone_installer(self):
+        result = subprocess.run(
+            ["make", "-n", "all", "MAKE=echo", "BUILD_STANDALONE=0"],
+            cwd=ROOT, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("-C Standalone", result.stdout)
+        basebin = (ROOT / "BaseBin/Makefile").read_text()
+        subprojects = re.search(r"^subprojects:\s*(.+)$", basebin, re.MULTILINE)
+        self.assertIsNotNone(subprojects)
+        self.assertNotIn("dopamine", subprojects.group(1).split())
+
+    def test_unported_standalone_build_is_rejected(self):
+        result = subprocess.run(
+            ["make", "-n", "all", "MAKE=echo", "BUILD_STANDALONE=1"],
+            cwd=ROOT, text=True, capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("standalone", result.stderr.lower())
+
+    def test_staged_external_headers_keep_source_timestamps(self):
+        build = ROOT / ".build/tests"
+        build.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="header-stage-", dir=build) as directory:
+            fixture = pathlib.Path(directory)
+            (fixture / "Makefile").write_bytes((ROOT / "BaseBin/Makefile").read_bytes())
+            headers = fixture / "_external/include"
+            headers.mkdir(parents=True)
+            source = headers / "port_timestamp_test.h"
+            source.write_text("#define PORT_TIMESTAMP_TEST 1\n")
+            for _ in range(2):
+                result = subprocess.run(
+                    ["make", ".include"], cwd=fixture, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                staged = fixture / ".include/port_timestamp_test.h"
+                self.assertEqual(staged.read_bytes(), source.read_bytes())
+                self.assertEqual(staged.stat().st_mtime_ns, source.stat().st_mtime_ns)
+
+
+if __name__ == "__main__":
+    unittest.main()

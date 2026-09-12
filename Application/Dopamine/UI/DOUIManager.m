@@ -39,7 +39,8 @@
 {
     NSString *latestVersion = [self getLatestReleaseTag];
     NSString *currentVersion = [self getLaunchedReleaseTag];
-    return [latestVersion numericalVersionRepresentation] > [currentVersion numericalVersionRepresentation];
+    return latestVersion.isQualifiedVersion && currentVersion.isQualifiedVersion &&
+        [latestVersion compareVersion:currentVersion] == NSOrderedDescending;
 }
 
 - (NSArray *)getUpdatesInRange:(NSString *)start end:(NSString *)end
@@ -48,18 +49,15 @@
     if (releases.count == 0)
         return @[];
 
-    long long startVersion = [start numericalVersionRepresentation];
-    long long endVersion = [end numericalVersionRepresentation];
     NSMutableArray *updates = [NSMutableArray new];
     for (NSDictionary *release in releases) {
         NSString *version = release[@"tag_name"];
         NSNumber *prerelease = release[@"prerelease"];
-        if ([prerelease boolValue]) {
+        if ([prerelease boolValue] || !version.isQualifiedVersion) {
             // Skip prereleases
             continue;
         }
-        long long numericalVersion = [version numericalVersionRepresentation];
-        if (numericalVersion > startVersion && numericalVersion <= endVersion) {
+        if ([version compareVersion:start] == NSOrderedDescending && [version compareVersion:end] != NSOrderedDescending) {
             [updates addObject:release];
         }
     }
@@ -71,7 +69,7 @@
     static dispatch_once_t onceToken;
     static NSArray *releases;
     dispatch_once(&onceToken, ^{
-        NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/opa334/Dopamine/releases"];
+        NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/roothide/Dopamine2-roothide/releases"];
         NSData *data = [NSData dataWithContentsOfURL:url];
         if (data) {
             NSError *error;
@@ -94,7 +92,7 @@
     NSString *jailbrokenVersion = [[DOEnvironmentManager sharedManager] jailbrokenVersion];
     NSString *launchedVersion = [self getLaunchedReleaseTag];
     
-    return [launchedVersion numericalVersionRepresentation] > [jailbrokenVersion numericalVersionRepresentation];
+    return [launchedVersion compareVersion:jailbrokenVersion] == NSOrderedDescending;
 }
 
 - (bool)launchedReleaseNeedsManualUpdate
@@ -117,7 +115,8 @@
     NSArray *releases = [self getLatestReleases];
     for (NSDictionary *release in releases) {
         NSNumber *prerelease = release[@"prerelease"];
-        if ([prerelease boolValue]) {
+        NSString *version = release[@"tag_name"];
+        if ([prerelease boolValue] || !version.isQualifiedVersion) {
             continue;
         }
         return release[@"tag_name"];

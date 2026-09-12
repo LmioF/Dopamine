@@ -253,6 +253,7 @@
 		8CF3E8662F72D57800931CA8 /* DarkSword.m in Sources */ = {isa = PBXBuildFile; fileRef = 8CF3E85B2F72D50200931CA8 /* DarkSword.m */; };
 		8CF3E8672F72DD9400931CA8 /* DarkSword.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8CF3E8582F72D45800931CA8 /* DarkSword.framework */; };
 		8CF3E8682F72DD9400931CA8 /* DarkSword.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 8CF3E8582F72D45800931CA8 /* DarkSword.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		D03A00000000000000000001 /* DORoothidePatchfinder.c in Sources */ = {isa = PBXBuildFile; fileRef = D03A00000000000000000002 /* DORoothidePatchfinder.c */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -697,6 +698,8 @@
 		8CF3E85B2F72D50200931CA8 /* DarkSword.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = DarkSword.m; sourceTree = "<group>"; };
 		8CF3E85E2F72D51200931CA8 /* DarkSword.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = DarkSword.h; sourceTree = "<group>"; };
 		C075B0CB2B8F2BCE009A26BB /* th */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = th; path = th.lproj/Localizable.strings; sourceTree = "<group>"; };
+		D03A00000000000000000002 /* DORoothidePatchfinder.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = DORoothidePatchfinder.c; sourceTree = "<group>"; };
+		D03A00000000000000000003 /* DORoothidePatchfinder.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = DORoothidePatchfinder.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -1076,6 +1079,8 @@
 				8614E355301AB63E00B1B88C /* DOBootstrapper+zstd.h */,
 				8614E356301AB63E00B1B88C /* DOBootstrapper+zstd.m */,
 				8C029F612B4E2E140071DE58 /* DOJailbreaker.h */,
+				D03A00000000000000000002 /* DORoothidePatchfinder.c */,
+				D03A00000000000000000003 /* DORoothidePatchfinder.h */,
 				8C029F622B4E2E140071DE58 /* DOJailbreaker.m */,
 				8C029F4C2B4E1FF30071DE58 /* DOExploit.h */,
 				8C029F4D2B4E1FF30071DE58 /* DOExploit.m */,
@@ -2296,6 +2301,7 @@
 				042479AE2B66916B0082581B /* DOUIManager.m in Sources */,
 				8C71981A2ABF0E82003C6658 /* DOAppDelegate.m in Sources */,
 				042479B72B66916B0082581B /* DOActionMenuView.m in Sources */,
+				D03A00000000000000000001 /* DORoothidePatchfinder.c in Sources */,
 				8C029F632B4E2E140071DE58 /* DOJailbreaker.m in Sources */,
 				040622AA2B77FE8E00393AAD /* DOPkgManagerPickerViewController.m in Sources */,
 				042479A82B66916B0082581B /* DOPSListController.m in Sources */,
@@ -3105,8 +3111,8 @@
 					"$(PROJECT_DIR)/Dopamine/Dependencies",
 					"$(PROJECT_DIR)/Dopamine/Resources",
 				);
-				MARKETING_VERSION = 3.0.9;
-				PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine;
+				MARKETING_VERSION = 3.0.9.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine-roothide;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -3143,8 +3149,8 @@
 					"$(PROJECT_DIR)/Dopamine/Dependencies",
 					"$(PROJECT_DIR)/Dopamine/Resources",
 				);
-				MARKETING_VERSION = 3.0.9;
-				PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine;
+				MARKETING_VERSION = 3.0.9.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine-roothide;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";

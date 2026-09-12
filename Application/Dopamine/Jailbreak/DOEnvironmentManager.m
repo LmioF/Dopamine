@@ -21,6 +21,7 @@
 #import <libjailbreak/display.h>
 #import <libjailbreak/machine_info.h>
 #import <libjailbreak/carboncopy.h>
+#import <libjailbreak/roothider.h>
 
 #import <IOKit/IOKitLib.h>
 #import "DOUIManager.h"
@@ -31,6 +32,7 @@
 
 int reboot3(uint64_t flags, ...);
 CFPropertyListRef MGCopyAnswer(CFStringRef);
+uint64_t resolve_jbrand_value(const char *name);
 extern char **environ;
 
 @implementation DOEnvironmentManager
@@ -53,6 +55,8 @@ extern char **environ;
         _bootstrapper = [[DOBootstrapper alloc] init];
         if ([self isJailbroken]) {
             gSystemInfo.jailbreakInfo.rootPath = strdup(jbclient_get_jbroot() ?: "");
+            NSString *root = [NSString stringWithUTF8String:gSystemInfo.jailbreakInfo.rootPath];
+            gSystemInfo.jailbreakInfo.jbrand = resolve_jbrand_value(root.lastPathComponent.UTF8String);
         }
         else if ([self isInstalledThroughTrollStore]) {
             [self locateJailbreakRoot];
@@ -97,6 +101,7 @@ extern char **environ;
     return [[self privatePrebootPath] stringByAppendingPathComponent:bootManifestString];
 }
 
+/*
 - (void)locateJailbreakRoot
 {
     if (!gSystemInfo.jailbreakInfo.rootPath) {
@@ -212,6 +217,7 @@ extern char **environ;
     
     return error;
 }
+*/
 
 - (BOOL)isArm64e
 {
@@ -278,6 +284,7 @@ extern char **environ;
 {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        if (!jbclient_roothide_jailbroken()) return;
         char *jbVersionC = NULL;
         _isJailbroken = jbclient_dopamine_is_jailbroken(&jbVersionC);
         if (jbVersionC) {
@@ -302,6 +309,8 @@ extern char **environ;
 - (BOOL)isJailbrokenWithOtherJailbreak
 {
     if (![self isJailbroken]) {
+        // A running 2.x environment cannot use the 3.x app-only IPC service.
+        if (jbclient_roothide_jailbroken()) return YES;
         uint32_t csFlags = 0;
         csops(getpid(), CS_OPS_STATUS, &csFlags, sizeof(csFlags));
         
@@ -539,6 +548,9 @@ extern char **environ;
                 else {
                     [[NSData data] writeToFile:safeModePath atomically:YES];
                 }
+/*************************** roothide specific *******************/
+                setBasebinDependency(enabled);
+/*************************** roothide specific *******************/
             }];
         }];
     }
@@ -612,6 +624,7 @@ extern char **environ;
     }
 }
 
+/*
 - (BOOL)isFakelibMounted
 {
     struct statfs fsb;
@@ -680,6 +693,7 @@ extern char **environ;
         actionBlock();
     }
 }
+*/
 
 - (NSString *)accessibleKernelPath
 {

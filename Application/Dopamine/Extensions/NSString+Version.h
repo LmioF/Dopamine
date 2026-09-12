@@ -12,6 +12,8 @@ NS_ASSUME_NONNULL_BEGIN
 @interface NSString (Version)
 
 - (NSInteger)numericalVersionRepresentation;
+- (NSComparisonResult)compareVersion:(NSString *)other;
+- (BOOL)isQualifiedVersion;
 
 @end
 

@@ -160,7 +160,6 @@
         
         SEL defGetter = @selector(readPreferenceValue:);
         SEL defSetter = @selector(setPreferenceValue:specifier:);
-        SEL expGetter = @selector(readExploitPreferenceValue:);
         
         NSSortDescriptor *prioritySortDescriptor = [NSSortDescriptor sortDescriptorWithKey:@"priority" ascending:NO];
         
@@ -181,7 +180,7 @@
                 exploitGroupSpecifier.name = DOLocalizedString(@"Section_Exploits");
                 [specifiers addObject:exploitGroupSpecifier];
                 
-                PSSpecifier *kernelExploitSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Kernel Exploit") target:self set:defSetter get:expGetter detail:nil cell:PSLinkListCell edit:nil];
+                PSSpecifier *kernelExploitSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Kernel Exploit") target:self set:defSetter get:defGetter detail:nil cell:PSLinkListCell edit:nil];
                 [kernelExploitSpecifier setProperty:@YES forKey:@"enabled"];
                 [kernelExploitSpecifier setProperty:exploitManager.preferredKernelExploit.identifier forKey:@"default"];
                 kernelExploitSpecifier.detailControllerClass = [DOPSExploitListItemsController class];
@@ -192,7 +191,7 @@
                 [specifiers addObject:kernelExploitSpecifier];
                 
                 if (envManager.isArm64e) {
-                    PSSpecifier *pacBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"PAC Bypass") target:self set:defSetter get:expGetter detail:nil cell:PSLinkListCell edit:nil];
+                    PSSpecifier *pacBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"PAC Bypass") target:self set:defSetter get:defGetter detail:nil cell:PSLinkListCell edit:nil];
                     [pacBypassSpecifier setProperty:@YES forKey:@"enabled"];
                     DOExploit *preferredPACBypass = exploitManager.preferredPACBypass;
                     if (!preferredPACBypass) {
@@ -256,6 +255,20 @@
             [appJitSpecifier setProperty:@YES forKey:@"default"];
             [specifiers addObject:appJitSpecifier];
             
+            
+            /**************************** roothide specfic *********************************/
+            NSString* namedesc = DOLocalizedString(@"Enable dyld patch");
+            if(envManager.isArm64e && NSProcessInfo.processInfo.operatingSystemVersion.majorVersion==15) {
+                namedesc = DOLocalizedString(@"Dyld Patch(Spinlock Fix)");
+            }
+            PSSpecifier *dyldPatchSpecifier = [PSSpecifier preferenceSpecifierNamed:namedesc target:self set:@selector(setDyldPatchEnabled:specifier:) get:@selector(readDyldPatchEnabled:) detail:nil cell:PSSwitchCell edit:nil];
+            [dyldPatchSpecifier setProperty:@YES forKey:@"enabled"];
+            [dyldPatchSpecifier setProperty:@"dyldPatchEnabled" forKey:@"key"];
+            [dyldPatchSpecifier setProperty:@NO forKey:@"default"];
+            [specifiers addObject:dyldPatchSpecifier];
+            /**************************** roothide specfic *********************************/
+            
+            
             PSSpecifier *jetsamSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Settings_Jetsam_Multiplier") target:self set:@selector(setJetsamMultiplier:specifier:) get:@selector(readJetsamMultiplier:) detail:nil cell:PSLinkListCell edit:nil];
             [jetsamSpecifier setProperty:@YES forKey:@"enabled"];
             [jetsamSpecifier setProperty:@"jetsamMultiplier" forKey:@"key"];
@@ -306,26 +319,6 @@
                     [specifiers addObject:reinstallPackageManagersSpecifier];
                 }
 
-                BOOL hideJailbreakButtonShown = (envManager.isJailbroken || (envManager.isInstalledThroughTrollStore && !envManager.isJailbreakHidden));
-                if (hideJailbreakButtonShown) {
-                    // The "Hide Jailbreak" button should be shown
-                    // - When jailbroken
-                    // - When Dopamine is installed by TrollStore and the jailbreak is not hidden yet
-                    PSSpecifier *hideUnhideJailbreakSpecifier = [PSSpecifier preferenceSpecifierNamed:@"" target:self set:defSetter get:defGetter detail:nil cell:PSStaticTextCell edit:nil];
-                    [hideUnhideJailbreakSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];
-                    [hideUnhideJailbreakSpecifier setProperty:buttonHeight forKey:@"height"];
-                    if (envManager.isJailbreakHidden) {
-                        [hideUnhideJailbreakSpecifier setProperty:@"Button_Unhide_Jailbreak" forKey:@"title"];
-                        [hideUnhideJailbreakSpecifier setProperty:@"eye" forKey:@"image"];
-                    }
-                    else {
-                        [hideUnhideJailbreakSpecifier setProperty:@"Button_Hide_Jailbreak" forKey:@"title"];
-                        [hideUnhideJailbreakSpecifier setProperty:@"eye.slash" forKey:@"image"];
-                    }
-                    [hideUnhideJailbreakSpecifier setProperty:@"hideUnhideJailbreakPressed" forKey:@"action"];
-                    [specifiers addObject:hideUnhideJailbreakSpecifier];
-                }
-
                 if (!envManager.isJailbroken && envManager.isInstalledThroughTrollStore) {
                     // The "Remove Jailbreak" button cannot show when being jailbroken since pressing it would kinda be russian roulette
                     // It might work, it might not and panic your device and leave it in a half uninstalled state
@@ -340,9 +333,6 @@
                     [specifiers addObject:removeJailbreakSpecifier];
                 }
                 
-                if (hideJailbreakButtonShown) {
-                    [actionsGroupSpecifier setProperty:DOLocalizedString(envManager.isJailbroken ? @"Hint_Hide_Jailbreak_Jailbroken" : @"Hint_Hide_Jailbreak") forKey:@"footerText"];
-                }
             }
         }
         
@@ -410,32 +400,6 @@
     if (!value) {
         return [specifier propertyForKey:@"default"];
     }
-    return value;
-}
-
-- (id)readExploitPreferenceValue:(PSSpecifier *)specifier
-{
-    id value = [self readPreferenceValue:specifier];
-
-    SEL dataSourceSel = nil;
-    NSString *selString = [specifier propertyForKey:@"valuesDataSource"];
-    if (selString) {
-        dataSourceSel = NSSelectorFromString(selString);
-    }
-
-    if (dataSourceSel && [value isKindOfClass:[NSString class]]) {
-        NSString *valueString = (NSString *)value;
-
-        IMP imp = [specifier.target methodForSelector:dataSourceSel];
-        if (imp) {
-            NSArray *(*func)(id, SEL) = (void *)imp;
-            NSArray *availableIdentifiers = func(specifier.target, dataSourceSel);
-            if (![availableIdentifiers containsObject:valueString]) {
-                return [specifier propertyForKey:@"default"];
-            }
-        }
-    }
-
     return value;
 }
 
@@ -707,12 +671,14 @@
     [self presentViewController:changeMobilePasswordAlert animated:YES completion:nil];
 }
 
+/*
 - (void)hideUnhideJailbreakPressed
 {
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     [envManager setJailbreakHidden:!envManager.isJailbreakHidden];
     [self reloadSpecifiers];
 }
+*/
 
 - (void)removeJailbreakPressed
 {
@@ -744,5 +710,64 @@
     [self reloadSpecifiers];
 }
 
+
+- (id)readDyldPatchEnabled:(PSSpecifier *)specifier
+{
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    if (envManager.isJailbroken) {
+        return @(jbclient_dyld_patch_enabled());
+    }
+    return [self readPreferenceValue:specifier];
+}
+
+- (void)setDyldPatchEnabled:(id)value specifier:(PSSpecifier *)specifier
+{
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    
+    bool enable = ((NSNumber *)value).boolValue;
+    
+    void (^confirmAction)(void) = ^{
+        
+        if (!envManager.isJailbroken) {
+            
+            [self setPreferenceValue:value specifier:specifier];
+            return;
+        }
+    
+        UIAlertController *userspaceRebootAlertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Title") message:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Body") preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertAction *rebootNowAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Menu_Reboot_Userspace_Title") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            if(jbclient_set_dyld_patch(enable) == 0) {
+                [self setPreferenceValue:value specifier:specifier];
+                [[DOEnvironmentManager sharedManager] rebootUserspace];
+            } else {
+                [self reloadSpecifiers];
+            }
+        }];
+        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Cancel") style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+            [self reloadSpecifiers];
+        }];
+        
+        [userspaceRebootAlertController addAction:cancelAction];
+        [userspaceRebootAlertController addAction:rebootNowAction];
+        [self presentViewController:userspaceRebootAlertController animated:YES completion:nil];
+    };
+    
+    
+    if(enable && envManager.isArm64e && NSProcessInfo.processInfo.operatingSystemVersion.majorVersion==15) {
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Warning") message:DOLocalizedString(@"When spinlock fix is ​​enabled, app extensions of blacklisted apps will be disabled and may also cause spinlock panics when the blacklisted app is in foreground/background.\n\nYou can first try disabling tweak injection for the app in Choicy (spinlock fix still works), and only blacklist the app if that doesn't work.") preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertAction *continueAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Continue") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            confirmAction();
+        }];
+        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Cancel") style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+            [self reloadSpecifiers];
+        }];
+        
+        [alert addAction:cancelAction];
+        [alert addAction:continueAction];
+        [self presentViewController:alert animated:YES completion:nil];
+    } else {
+        confirmAction();
+    }
+}
 
 @end

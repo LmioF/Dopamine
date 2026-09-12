@@ -9,20 +9,24 @@
 
 all: basebin.tar
 
-subprojects: ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook rootlesshooks dopamine
+ifeq ($(BUILD_STANDALONE), 1)
+$(error The standalone/Corellium installer has not been ported to roothide)
+endif
+
+subprojects: ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook roothidehooks jailbreakd bootstrapper
 
 ChOma: .build .include
 	@$(MAKE) -C ChOma TARGET=ios DISABLE_SIGNING=1 DISABLE_TESTS=1 DYLIB_LDFLAGS="-install_name @loader_path/libchoma.dylib"
 	@ldid -Cadhoc -s ChOma/output/ios/lib/libchoma.dylib
 	@cp ChOma/output/ios/lib/libchoma.dylib .build
-	@cp -r ChOma/output/ios/include/choma .include
+	@cp -Rp ChOma/output/ios/include/choma .include
 
 XPF: .build .include ChOma
 	@$(MAKE) -C XPF output/ios/libxpf.dylib CHOMA_PATH=../ChOma CHOMA_DYLIB_PATH="../.build"
 	@ldid -Cadhoc -s XPF/output/ios/libxpf.dylib
 	@cp XPF/output/ios/libxpf.dylib .build/libxpf.dylib
 	@mkdir -p .include/xpf
-	@cp XPF/src/xpf.h .include/xpf
+	@cp -p XPF/src/xpf.h .include/xpf
 
 MachOMerger: .build .include
 	@$(MAKE) -C MachOMerger
@@ -37,7 +41,9 @@ libjailbreak: .build .include ChOma
 	$(MAKE) -C libjailbreak
 	@cp libjailbreak/libjailbreak.dylib .build
 	@mkdir -p .include/libjailbreak
-	@cp libjailbreak/src/*.h .include/libjailbreak
+	@cp -p libjailbreak/src/*.h .include/libjailbreak
+	@mkdir -p .include/libjailbreak/roothider
+	@cp -p libjailbreak/src/roothider/*.h .include/libjailbreak/roothider
 
 systemhook: .build .include libjailbreak
 	$(MAKE) -C systemhook
@@ -71,9 +77,17 @@ watchdoghook: .build .include libjailbreak
 	$(MAKE) -C watchdoghook
 	@cp watchdoghook/watchdoghook.dylib .build
 
-rootlesshooks: .build .include libjailbreak
-	$(MAKE) -C rootlesshooks
-	@cp rootlesshooks/.theos/obj/rootlesshooks.dylib .build
+roothidehooks: .build .include libjailbreak
+	$(MAKE) -C roothidehooks
+	@cp roothidehooks/.theos/obj/roothidehooks.dylib .build
+
+bootstrapper: .build .include libjailbreak
+	$(MAKE) -C bootstrapper
+	@cp bootstrapper/bootstrapper .build
+
+jailbreakd: .build .include libjailbreak
+	$(MAKE) -C jailbreakd
+	@cp jailbreakd/jailbreakd .build
 
 dopamine: .build .include libjailbreak XPF ChOma
 	$(MAKE) -C dopamine
@@ -88,7 +102,7 @@ dopamine: .build .include libjailbreak XPF ChOma
 .include:
 	rm -rf .include
 	mkdir -p .include
-	cp -r _external/include/* .include
+	cp -Rp _external/include/* .include
 # If the SDK already ships XPC (it does so in iOS 17.4+), remove the local copy of it
 ifneq (,$(wildcard $(shell xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc.modulemap))
 	rm -rf .include/xpc
@@ -120,7 +134,9 @@ clean:
 	@$(MAKE) -C jbctl $@
 	@$(MAKE) -C idownloadd $@
 	@$(MAKE) -C watchdoghook $@
-	@$(MAKE) -C rootlesshooks $@
+	@$(MAKE) -C roothidehooks $@
+	@$(MAKE) -C bootstrapper $@
+	@$(MAKE) -C jailbreakd $@
 	@$(MAKE) -C dyldhook $@
 	@$(MAKE) -C dopamine $@
 	@$(MAKE) -C hookd $@
@@ -129,4 +145,4 @@ clean:
 	@rm -rf basebin.tar
 	@rm -rf basebin.tc
 
-.PHONY: clean .build .include ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook rootlesshooks basebin.tc dyldhook basebin.tar
+.PHONY: clean subprojects .build .include ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook roothidehooks basebin.tc dyldhook basebin.tar jailbreakd bootstrapper dopamine
