@@ -22,9 +22,12 @@
 #include <sys/mount.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <poll.h>
+#include <time.h>
 extern char **environ;
 
 #include "roothider.h"
+#include "roothider/bootlog.h"
 
 #define FAKE_PHYSPAGE_TO_MAP 0x13370000
 
@@ -1039,12 +1042,25 @@ void proc_copy_ucred(uint64_t procCopyFrom, uint64_t procCopyTo)
 
 int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, gid_t groups[NGROUPS_MAX])
 {
-	int comPipe[2];
-	pipe(comPipe);
-
-	posix_spawn_file_actions_t act;
-	posix_spawn_file_actions_init(&act);
-	posix_spawn_file_actions_adddup2(&act, comPipe[1], 3);
+	int comPipe[2] = {-1, -1};
+	posix_spawn_file_actions_t act = NULL;
+	posix_spawnattr_t attr = NULL;
+	pid_t pid = 0;
+	int error = 0;
+	const char *phase = "spawn";
+	if (pipe(comPipe) != 0) return -1;
+	if (fcntl(comPipe[0], F_SETFD, FD_CLOEXEC) == -1 ||
+		fcntl(comPipe[1], F_SETFD, FD_CLOEXEC) == -1 ||
+		fcntl(comPipe[0], F_SETFL, O_NONBLOCK) == -1) {
+		error = errno;
+		goto cleanup;
+	}
+	if ((error = posix_spawn_file_actions_init(&act)) != 0) goto cleanup;
+	if ((error = posix_spawn_file_actions_adddup2(&act, comPipe[1], 3)) != 0) goto cleanup;
+	if (comPipe[0] != 3 && (error = posix_spawn_file_actions_addclose(&act, comPipe[0])) != 0) goto cleanup;
+	if (comPipe[1] != 3 && (error = posix_spawn_file_actions_addclose(&act, comPipe[1])) != 0) goto cleanup;
+	if ((error = posix_spawnattr_init(&attr)) != 0) goto cleanup;
+	if ((error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED)) != 0) goto cleanup;
 
 	char uidString[12];
 	snprintf(uidString, sizeof(uidString), "%d", uid);
@@ -1087,28 +1103,73 @@ int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t rui
 	}
 	argv[idx++] = NULL;
 
-	// In order to speed things up, skip any injection into the child process we spawn
+	// This same-executable credential donor must not enter normal check-in or tweak injection.
 	const char *envp[] = {
 		"_SafeMode=1",
 		"DYLD_HOOK_SETUID=1",
+		"DYLD_IN_CACHE=0",
 		NULL,
 	};
 
-	pid_t pid = 0;
-	int r = posix_spawn(&pid, procPath, &act, NULL, (char *const *)argv, (char *const *)envp);
-	posix_spawn_file_actions_destroy(&act);
-	if (r == 0) {
-		int r = 0;
-		read(comPipe[0], &r, sizeof(r));
-		close(comPipe[0]);
-		close(comPipe[1]);
-		return pid;
+	error = posix_spawn(&pid, procPath, &act, &attr, (char *const *)argv, (char *const *)envp);
+	if (error != 0) {
+		pid = 0;
+		goto cleanup;
+	}
+	close(comPipe[1]);
+	comPipe[1] = -1;
+
+	phase = "stop";
+	uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) + 5000000000ULL;
+	for (;;) {
+		bool paused = false;
+		if (proc_paused(pid, &paused) != 0) { error = ESRCH; goto cleanup; }
+		if (paused) break;
+		if (clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) { error = ETIMEDOUT; goto cleanup; }
+		usleep(10000);
+	}
+	// Match the existing child patcher: the task's IPC state can lag behind SSTOP.
+	usleep(100000);
+	phase = "loader";
+	int pidversion = proc_get_pidversion(pid);
+	if (jbdPrepareCredentialHelper(pid, pidversion, deadline) != 0) { error = errno; goto cleanup; }
+	phase = "resume";
+	if (kill(pid, SIGCONT) != 0) { error = errno; goto cleanup; }
+
+	phase = "reply";
+	for (;;) {
+		uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+		if (now >= deadline) { error = ETIMEDOUT; goto cleanup; }
+		int remaining = (int)((deadline - now + 999999) / 1000000);
+		struct pollfd descriptor = {.fd = comPipe[0], .events = POLLIN};
+		int ready = poll(&descriptor, 1, remaining);
+		if (ready < 0 && errno == EINTR) continue;
+		if (ready < 0) { error = errno; goto cleanup; }
+		if (ready == 0) { error = ETIMEDOUT; goto cleanup; }
+		unsigned char marker = 0;
+		ssize_t count = read(comPipe[0], &marker, sizeof(marker));
+		if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+		if (count != sizeof(marker) || marker != 0x42) { error = EPROTO; goto cleanup; }
+		break;
 	}
 
-	close(comPipe[0]);
-	close(comPipe[1]);
-
-	return -1;
+cleanup:
+	if (act) posix_spawn_file_actions_destroy(&act);
+	if (attr) posix_spawnattr_destroy(&attr);
+	if (comPipe[0] >= 0) close(comPipe[0]);
+	if (comPipe[1] >= 0) close(comPipe[1]);
+	if (error != 0 && pid > 0) {
+		kill(pid, SIGKILL);
+		uint64_t reapDeadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) + 1000000000ULL;
+		while (waitpid(pid, NULL, WNOHANG) == 0 && clock_gettime_nsec_np(CLOCK_MONOTONIC) < reapDeadline) usleep(10000);
+	}
+	if (error != 0) {
+		char message[256];
+		snprintf(message, sizeof(message), "credential helper: %s failed error=%d child=%d path=%.128s", phase, error, pid, procPath);
+		roothide_bootlog(message);
+		errno = error;
+	}
+	return error == 0 ? pid : -1;
 }
 
 int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, gid_t groups[NGROUPS_MAX])
@@ -1120,10 +1181,12 @@ int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gi
 		}
 
 		uint64_t childProc = proc_find(childPid);
-		proc_copy_ucred(childProc, proc);
+		if (childProc) proc_copy_ucred(childProc, proc);
 
 		kill(childPid, SIGKILL);
-		cmd_wait_for_exit(childPid);
+		uint64_t reapDeadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) + 1000000000ULL;
+		while (waitpid(childPid, NULL, WNOHANG) == 0 && clock_gettime_nsec_np(CLOCK_MONOTONIC) < reapDeadline) usleep(10000);
+		if (!childProc) return -1;
 	}
 	else {
 		uint64_t ucred = proc_ucred(proc);

@@ -1,4 +1,7 @@
 #include <spawn.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
 #include <assert.h>
 #include <pthread.h>
@@ -31,6 +34,7 @@ int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t * __restrict attr,
 
 static bool __firstLoad = false;
 static bool __jailbreakd_initialized = false;
+static int (*gJailbreakdBootstrapHandler)(xpc_object_t) = NULL;
 mach_port_t gJailbreakdPort = MACH_PORT_NULL;
 
 #define JAILBREAKD_CLIENT_PORT_FAST_GET
@@ -112,8 +116,8 @@ int spawnJailbreakd()
 			xpc_object_t xdict = NULL;
 			int err = xpc_pipe_receive(bootstraport, &xdict);
 			if(err == 0) {
-				abort(); /* xpchook should handle the jbclient messages, should never go here */
-				//jbserver_received_xpc_message(&gGlobalServer, xdict);
+				// Symbol rebinding does not intercept libxpc's internal receive calls.
+				gJailbreakdBootstrapHandler(xdict);
 				xpc_release(xdict);
 			}
 		});
@@ -143,13 +147,15 @@ int spawnJailbreakd()
 	return 0;
 }
 
-int initJailbreakd(bool firstLoad)
+int initJailbreakd(bool firstLoad, int (*bootstrapHandler)(xpc_object_t))
 {
 	assert(getpid() == 1);
 
 	assert(__jailbreakd_initialized == false);
+	if (!bootstrapHandler) return EINVAL;
 
 	__firstLoad = firstLoad;
+	gJailbreakdBootstrapHandler = bootstrapHandler;
 
 	if(registerServerPort() != 0) {
 		JBLogError("registerServerPort failed");
@@ -339,6 +345,56 @@ int jbdSystemwideLog(const char* fmt, ...)
 	int result = xpc_dictionary_get_int64(reply, "result");
 	xpc_release(reply);
 	return result;
+}
+
+int jbdPrepareCredentialHelper(int pid, int pidversion, uint64_t deadline)
+{
+	uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	if (deadline <= now) { errno = ETIMEDOUT; return -1; }
+	if (pid <= 1 || pidversion <= 0) { errno = ESRCH; return -1; }
+
+	// A stalled service must not accumulate blocked launchd workers on subsequent requests.
+	static atomic_bool inFlight = false;
+	bool expected = false;
+	if (!atomic_compare_exchange_strong(&inFlight, &expected, true)) {
+		errno = EBUSY;
+		return -1;
+	}
+	xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
+	dispatch_semaphore_t completion = dispatch_semaphore_create(0);
+	if (!message || !completion) {
+		if (message) xpc_release(message);
+		if (completion) dispatch_release(completion);
+		atomic_store(&inFlight, false);
+		errno = ENOMEM;
+		return -1;
+	}
+	xpc_dictionary_set_uint64(message, "id", JBD_MSG_PREPARE_CREDENTIAL_HELPER);
+	xpc_dictionary_set_int64(message, "pid", pid);
+	xpc_dictionary_set_int64(message, "pidversion", pidversion);
+	xpc_dictionary_set_uint64(message, "deadline", deadline);
+	__block int result = EIO;
+	dispatch_retain(completion);
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		xpc_object_t reply = jailbreakdXpcRequest(message);
+		if (reply) {
+			xpc_object_t value = xpc_get_type(reply) == XPC_TYPE_DICTIONARY ? xpc_dictionary_get_value(reply, "result") : NULL;
+			int64_t code = value && xpc_get_type(value) == XPC_TYPE_INT64 ? xpc_int64_get_value(value) : -1;
+			result = code >= 0 && code <= INT32_MAX ? (int)code : EPROTO;
+			xpc_release(reply);
+		}
+		xpc_release(message);
+		atomic_store(&inFlight, false);
+		dispatch_semaphore_signal(completion);
+		dispatch_release(completion);
+	});
+	now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	uint64_t remaining = deadline > now ? deadline - now : 0;
+	long timedOut = dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, remaining));
+	dispatch_release(completion);
+	if (timedOut) { errno = ETIMEDOUT; return -1; }
+	if (result != 0) { errno = result; return -1; }
+	return 0;
 }
 
 int jbdSpawnPatchChild(int pid, bool resume)

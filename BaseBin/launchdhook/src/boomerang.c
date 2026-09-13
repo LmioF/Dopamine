@@ -8,6 +8,7 @@
 #include <libjailbreak/kcall_Fugu14.h>
 #include <libjailbreak/kcall_arm64.h>
 #include <libjailbreak/stock_fixes.h>
+#include <libjailbreak/roothider/bootlog.h>
 #include <unistd.h>
 
 int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *__restrict attr, mach_port_t portarray[], uint32_t count);
@@ -19,6 +20,7 @@ int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *__restrict attr, 
 
 void boomerang_stashPrimitives()
 {
+	roothide_bootlog("launchd: stashing primitives begin");
 	dispatch_semaphore_t boomerangDone = dispatch_semaphore_create(0);
 
 	mach_port_t serverPort = MACH_PORT_NULL;
@@ -44,11 +46,13 @@ void boomerang_stashPrimitives()
 	posix_spawnattr_init(&attr);
 	posix_spawnattr_set_registered_ports_np(&attr, (mach_port_t[]){ MACH_PORT_NULL, MACH_PORT_NULL, serverPort }, 3);
 	int ret = posix_spawn(&boomerangPid, JBROOT_PATH("/basebin/boomerang"), NULL, &attr, NULL, NULL);
+	roothide_bootlog(ret == 0 ? "launchd: boomerang spawned" : "launchd: boomerang spawn failed");
 	if (ret != 0) return;
 	posix_spawnattr_destroy(&attr);
 
 	// Wait for boomerang to retrieve the primitives from launchd (handled in server above)
 	dispatch_semaphore_wait(boomerangDone, DISPATCH_TIME_FOREVER);
+	roothide_bootlog("launchd: boomerang received primitives");
 	dispatch_source_cancel(serverSource);
 	mach_port_deallocate(mach_task_self(), serverPort);
 
@@ -60,6 +64,7 @@ void boomerang_stashPrimitives()
 
 int boomerang_recoverPrimitives(bool firstRetrieval, bool shouldEndBoomerang)
 {
+	roothide_bootlog(firstRetrieval ? "launchd: first primitive recovery begin" : "launchd: reboot primitive recovery begin");
 	// Mach port to boomerang should be stored in our registeredPorts[2]
 	// Use it to recover primitives, afterwards replace it with MACH_PORT_NULL to make launchd happy
 	mach_port_t *registeredPorts;
@@ -85,10 +90,12 @@ int boomerang_recoverPrimitives(bool firstRetrieval, bool shouldEndBoomerang)
 	// But from launchd it's generally fine, no clue why
 	bool physrwPTE = firstRetrieval && !is_kcall_available();
 	jbclient_initialize_primitives_internal(physrwPTE);
+	roothide_bootlog("launchd: recovery RPC returned");
 
 	if (shouldEndBoomerang) {
 		// Send done message to boomerang
 		jbclient_boomerang_done();
+		roothide_bootlog("launchd: sent boomerang completion");
 
 		// Remove boomerang zombie proc if needed
 		if (boomerangPid != 0) {

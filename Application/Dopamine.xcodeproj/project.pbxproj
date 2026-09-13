@@ -215,7 +215,7 @@
 		8C5FA96E2BDD7898008C246F /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C5FA93F2BDD5039008C246F /* IOKit.framework */; };
 		8C5FA96F2BDD789C008C246F /* IOSurface.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C5FA9412BDD503D008C246F /* IOSurface.framework */; };
 		8C5FA9712BDD81EF008C246F /* LICENSE_weightBufs.md in Resources */ = {isa = PBXBuildFile; fileRef = 8C5FA9702BDD81EF008C246F /* LICENSE_weightBufs.md */; };
-		8C5FF1CB301BAAF100BCA01F /* launchctl_1_1.2.0_iphoneos-arm64.deb in Resources */ = {isa = PBXBuildFile; fileRef = 8C5FF1C9301BA9E800BCA01F /* launchctl_1_1.2.0_iphoneos-arm64.deb */; };
+		8C5FF1CB301BAAF100BCA01F /* launchctl-roothide.deb in Resources */ = {isa = PBXBuildFile; fileRef = 8C5FF1C9301BA9E800BCA01F /* launchctl-roothide.deb */; };
 		8C609C9E2C19B4270023DD12 /* NSString+Version.m in Sources */ = {isa = PBXBuildFile; fileRef = 8C609C9C2C19AECF0023DD12 /* NSString+Version.m */; };
 		8C609C9F2C19B6FA0023DD12 /* libkrw-dopamine.deb in Resources */ = {isa = PBXBuildFile; fileRef = 8C609C992C19AC250023DD12 /* libkrw-dopamine.deb */; };
 		8C6599DB2C555A60000FF57F /* DOPSJetsamListItemsController.m in Sources */ = {isa = PBXBuildFile; fileRef = 8C6599DA2C555A60000FF57F /* DOPSJetsamListItemsController.m */; };
@@ -657,7 +657,7 @@
 		8C5FA9582BDD6C0C008C246F /* kernel_rw.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = kernel_rw.h; sourceTree = "<group>"; };
 		8C5FA9592BDD6C0C008C246F /* exploit.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = exploit.h; sourceTree = "<group>"; };
 		8C5FA9702BDD81EF008C246F /* LICENSE_weightBufs.md */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = net.daringfireball.markdown; path = LICENSE_weightBufs.md; sourceTree = "<group>"; };
-		8C5FF1C9301BA9E800BCA01F /* launchctl_1_1.2.0_iphoneos-arm64.deb */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "launchctl_1_1.2.0_iphoneos-arm64.deb"; path = "../Packages/additional/launchctl_1_1.2.0_iphoneos-arm64.deb"; sourceTree = SOURCE_ROOT; };
+		8C5FF1C9301BA9E800BCA01F /* launchctl-roothide.deb */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "launchctl-roothide.deb"; path = "../Packages/launchctl/launchctl-roothide.deb"; sourceTree = SOURCE_ROOT; };
 		8C609C992C19AC250023DD12 /* libkrw-dopamine.deb */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "libkrw-dopamine.deb"; path = "../../../Packages/libkrw-provider/libkrw-dopamine.deb"; sourceTree = "<group>"; };
 		8C609C9C2C19AECF0023DD12 /* NSString+Version.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "NSString+Version.m"; sourceTree = "<group>"; };
 		8C609C9D2C19AEE70023DD12 /* NSString+Version.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "NSString+Version.h"; sourceTree = "<group>"; };
@@ -1422,7 +1422,7 @@
 				8C609C992C19AC250023DD12 /* libkrw-dopamine.deb */,
 				8CCD8A832B6F165A004B72B0 /* libroot.deb */,
 				8CCD2FC32B77AA9200F9C5DA /* basebin-link.deb */,
-				8C5FF1C9301BA9E800BCA01F /* launchctl_1_1.2.0_iphoneos-arm64.deb */,
+				8C5FF1C9301BA9E800BCA01F /* launchctl-roothide.deb */,
 				04DD0B362B7BA6180055DE4F /* LICENSE.md */,
 				04DD0B392B7BF3E80055DE4F /* LICENSE_libc.md */,
 				8C56D4B82B7C0DF2001C03D3 /* LICENSE_ChOma.md */,
@@ -1981,7 +1981,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				8C5FF1CB301BAAF100BCA01F /* launchctl_1_1.2.0_iphoneos-arm64.deb in Resources */,
+				8C5FF1CB301BAAF100BCA01F /* launchctl-roothide.deb in Resources */,
 				8C609C9F2C19B6FA0023DD12 /* libkrw-dopamine.deb in Resources */,
 				04DD0B372B7BA6180055DE4F /* LICENSE.md in Resources */,
 				04DD0B3A2B7BF3E80055DE4F /* LICENSE_libc.md in Resources */,

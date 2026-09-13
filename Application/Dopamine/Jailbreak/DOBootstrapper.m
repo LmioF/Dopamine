@@ -12,6 +12,7 @@
 #import <libjailbreak/info.h>
 #import <libjailbreak/util.h>
 #import <libjailbreak/jbclient_xpc.h>
+#import <libjailbreak/roothider/bootlog.h>
 #import <sys/mount.h>
 #import <dlfcn.h>
 #import <sys/stat.h>
@@ -20,7 +21,7 @@
 #define LIBKRW_DOPAMINE_BUNDLED_VERSION @"2.0.3"
 #define LIBROOT_DOPAMINE_BUNDLED_VERSION @"1.0.1"
 #define BASEBIN_LINK_BUNDLED_VERSION @"1.0.0"
-#define LAUNCHCTL_BUNDLED_VERSION @"1:1.2.0"
+#define LAUNCHCTL_BUNDLED_VERSION @"1:1.1.1-2+dp3.1"
 
 static NSDictionary *gBundledPackages = @{
     @"libkrw0-dopamine" : LIBKRW_DOPAMINE_BUNDLED_VERSION,
@@ -1177,10 +1178,24 @@ int getCFMajorVersion(void)
 
 - (NSError *)finalizeBootstrap
 {
+    if (__builtin_available(iOS 19.0, *)) {
+        if ([self shouldInstallPackage:@"launchctl"]) {
+            NSString *package = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"launchctl-roothide.deb"];
+            roothide_bootlog("bootstrap: installing compatible roothide launchctl");
+            int result = [self installPackage:package];
+            if (result != 0) {
+                return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to install compatible launchctl: %d", result]}];
+            }
+            roothide_bootlog("bootstrap: compatible launchctl installed");
+        }
+    }
+
     // Initial setup on first jailbreak
     if ([[NSFileManager defaultManager] fileExistsAtPath:jbrootPrefix(@"/prep_bootstrap.sh")]) {
         [[DOUIManager sharedInstance] sendLog:@"Finalizing Bootstrap" debug:NO];
+        roothide_bootlog("bootstrap: prep script begin");
         int r = exec_cmd_trusted(JBROOT_PATH("/bin/sh"), "/prep_bootstrap.sh", NULL);
+        roothide_bootlog("bootstrap: prep script returned");
         if (r != 0) {
             return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"prep_bootstrap.sh returned %d\n", r]}];
         }
@@ -1189,7 +1204,9 @@ int getCFMajorVersion(void)
         if (error) return error;
         
         NSString *roothideManager = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"roothideapp.deb"];
+        roothide_bootlog("bootstrap: package managers installed; installing roothide manager");
          r = [self installPackage:roothideManager];
+        roothide_bootlog("bootstrap: roothide manager installer returned");
         if (r != 0) return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to install roothideManager: %d\n", r]}];
 
         //Remove the shits triggered by uicache before first jailbreak is fully activated.
@@ -1217,6 +1234,7 @@ int getCFMajorVersion(void)
     }
     
     BOOL shouldInstallLibkrw = [self shouldInstallPackage:@"libkrw0-dopamine"];
+    roothide_bootlog("bootstrap: checking bundled packages");
     BOOL shouldInstallBasebinLink = [self shouldInstallPackage:@"dopamine-basebin-link"];
     
     if (shouldInstallLibkrw || shouldInstallBasebinLink) {
@@ -1255,6 +1273,7 @@ int getCFMajorVersion(void)
         [[NSFileManager defaultManager] removeItemAtPath:jbrootPrefix(@"/usr/lib/libroot.dylib") error:nil];
     }
     NSString *librootPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"libroot.deb"];
+    roothide_bootlog("bootstrap: unpacking libroot");
     NSString* unpackedPath = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
     int ret = exec_cmd_trusted(JBROOT_PATH("/usr/bin/dpkg-deb"), "-R", rootfsPrefix(librootPath).fileSystemRepresentation, rootfsPrefix(unpackedPath).fileSystemRepresentation, NULL);
     if (ret != 0) {
@@ -1271,6 +1290,7 @@ int getCFMajorVersion(void)
 
     
     [[NSString stringWithFormat:@"%d",DOPAMINE_INSTALL_VERSION] writeToFile:jbrootPrefix(@"/.installed_dopamine") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    roothide_bootlog("bootstrap: writing installation markers");
     
     if(jbclient_palehide_present()) {
         [@"" writeToFile:jbrootPrefix(@"/.installed_palera1n") atomically:YES encoding:NSUTF8StringEncoding error:nil];

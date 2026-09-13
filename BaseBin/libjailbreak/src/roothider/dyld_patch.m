@@ -11,6 +11,7 @@
 #include "../libjailbreak.h"
 #include "common.h"
 #include "log.h"
+#include "bootlog.h"
 
 uint64_t show_dyld_regions(mach_port_t task, bool more)
 {
@@ -589,7 +590,8 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 {
     int ret = 0;
 
-    kern_return_t kr;
+    kern_return_t kr = KERN_SUCCESS;
+    const char *phase = "dyld metadata";
     task_port_t task = MACH_PORT_NULL;
     vm_address_t  remoteLoadAddress = 0;
 
@@ -607,6 +609,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
         return -1;
     }
 
+    phase = "task_for_pid";
     kr = task_for_pid(mach_task_self(), pid, &task);
     if(kr != KERN_SUCCESS || !MACH_PORT_VALID(task)) {
         JBLogError("task_for_pid failed: %x,%s task=%x", kr, mach_error_string(kr), task);
@@ -617,6 +620,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 
     task_dyld_info_data_t dyldInfo={0};
     uint32_t count = TASK_DYLD_INFO_COUNT;
+    phase = "task_info";
     kr = task_info(task, TASK_DYLD_INFO, (task_info_t)&dyldInfo, &count);
     if(kr != KERN_SUCCESS) {
     	JBLogError("task_info failed: %d,%s", kr, mach_error_string(kr));
@@ -628,6 +632,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
     JBLogDebug("default dyld=%p entry=%p", (void*)dyld_address, (void*)dyld_entry);
 
     vm_prot_t cur_prot=0, max_prot=0;
+    phase = "remap";
     kr = vm_remap(task, &remoteLoadAddress, patchedDyldInfo->vmSpaceSize, 0, VM_FLAGS_ANYWHERE, mach_task_self(), (mach_vm_address_t)patchedDyldInfo->imageAddress, true, &cur_prot, &max_prot, VM_INHERIT_COPY);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_remap %d,%s", kr, mach_error_string(kr));
@@ -636,6 +641,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 
     JBLogDebug("remap dyld=%p prot=%x/%x", remoteLoadAddress, cur_prot, max_prot);
 
+    phase = "kernel process lookup";
     uint64_t bsd_proc = proc_find(pid);
     if(!bsd_proc) {
         JBLogError("proc_find %d failed", pid);
@@ -691,6 +697,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
     
     thread_act_array_t allThreads=NULL;
     mach_msg_type_number_t threadCount = 0;
+    phase = "task_threads";
     kr = task_threads(task, &allThreads, &threadCount);
     if(kr != KERN_SUCCESS) {
         JBLogError("task_threads failed: %d,%s", kr, mach_error_string(kr));
@@ -707,6 +714,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 
         arm_thread_state64_t threadState={0};
         mach_msg_type_number_t threadStateCount = ARM_THREAD_STATE64_COUNT;
+        phase = "thread_get_state";
         kr = thread_get_state(allThreads[i], ARM_THREAD_STATE64, (thread_state_t)&threadState, &threadStateCount);
         if(kr != KERN_SUCCESS) {
             JBLogError("thread_get_state %d,%s", kr, mach_error_string(kr));
@@ -721,6 +729,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
         uint64_t strippedSP = (uint64_t)__darwin_arm_thread_state64_get_sp(strippedState);
         uint64_t strippedFP = (uint64_t)__darwin_arm_thread_state64_get_fp(strippedState);
         uint64_t strippedLR = (uint64_t)__darwin_arm_thread_state64_get_lr(strippedState);
+        phase = "entrypoint match";
         JBLogDebug("strippedState PC=%llx SP=%llx FP=%llx LR=%llx", strippedPC, strippedSP, strippedFP, strippedLR);
 
         if(strippedPC == dyld_entry)
@@ -736,6 +745,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 
                 cs_allow_invalid(bsd_proc, false);
 
+                phase = "entrypoint trampoline";
                 if(hook_dyld_entry(task, dyld_address, dyld_entry, (uint64_t)new_entry) != 0) {
                     JBLogError("hook_dyld_entry failed");
                     goto reentry_end;
@@ -750,12 +760,14 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
             new_entry = ptrauth_sign_unauthenticated(new_entry, ptrauth_key_process_independent_code, 0);
 #endif
             __darwin_arm_thread_state64_set_pc_fptr(threadState, new_entry);
+            phase = "thread_set_state";
             kr = thread_set_state(allThreads[i], ARM_THREAD_STATE64, (thread_state_t)&threadState, threadStateCount);
             if(kr != KERN_SUCCESS) {
                 JBLogError("thread_set_state failed: %d,%s", kr, mach_error_string(kr));
                 goto reentry_end;
             }
 
+            phase = "old mapping release";
             kr = vm_deallocate(task, dyld_address, stockDyldInfo->vmSpaceSize);
             if(kr != KERN_SUCCESS) {
                 JBLogError("vm_deallocate old dyld failed: %d,%s", kr, mach_error_string(kr));
@@ -778,6 +790,7 @@ reentry_end:
         goto failed;
     }
 
+    phase = "dyld info publication";
     if(task_set_dyld_info(mach_task, remoteLoadAddress + patchedDyldInfo->all_image_info_addr, patchedDyldInfo->all_image_info_size) != 0) {
         JBLogError("task_set_dyld_info failed");
         goto failed;
@@ -792,6 +805,11 @@ reentry_end:
     goto final;
 
 failed:
+    {
+        char message[192];
+        snprintf(message, sizeof(message), "dyld preparation: phase=%s child=%d kr=%d", phase, pid, kr);
+        roothide_bootlog(message);
+    }
     ret = -1;
     if(remoteLoadAddress) {
         vm_deallocate(task, remoteLoadAddress, patchedDyldInfo->vmSpaceSize);

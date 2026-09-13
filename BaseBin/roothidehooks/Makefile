@@ -18,4 +18,5 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 after-roothidehooks-all::
 	install_name_tool -rpath @loader_path/.jbroot/Library/Frameworks @loader_path/present $(THEOS_OBJ_DIR)/roothidehooks.dylib
 	install_name_tool -change @loader_path/.jbroot/usr/lib/libsubstrate.dylib @rpath/CydiaSubstrate.framework/CydiaSubstrate $(THEOS_OBJ_DIR)/roothidehooks.dylib
+	install_name_tool -change @loader_path/.jbroot/usr/lib/libroothide.dylib @loader_path/../usr/lib/libroothide.dylib $(THEOS_OBJ_DIR)/roothidehooks.dylib
 	ldid -S $(THEOS_OBJ_DIR)/roothidehooks.dylib

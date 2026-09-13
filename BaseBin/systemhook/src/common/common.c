@@ -8,6 +8,8 @@
 #include <sandbox.h>
 #include <paths.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <dlfcn.h>
 #include "envbuf.h"
 #include "private.h"
@@ -354,9 +356,18 @@ static int spawn_exec_hook_common(bool isExec,
 	}
 
 	if (r == 0 && childPid > 0 && (personaFixUid == 0 || personaFixGid == 0)) {
-		jbclient_persona_fix(childPid, personaFixUid, personaFixGid);
-		if (personaFixNeedsResume) {
-			kill(childPid, SIGCONT);
+		if (jbclient_persona_fix(childPid, personaFixUid, personaFixGid) != 0) {
+			r = EPERM;
+		}
+		else if (personaFixNeedsResume && kill(childPid, SIGCONT) != 0) {
+			r = errno;
+		}
+		if (r != 0) {
+			// Running with the wrong identity is not a successful spawn.
+			if (kill(childPid, SIGKILL) == 0) {
+				uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) + 1000000000ULL;
+				while (waitpid(childPid, NULL, WNOHANG) == 0 && clock_gettime_nsec_np(CLOCK_MONOTONIC) < deadline) usleep(10000);
+			}
 		}
 	}
 

@@ -5,8 +5,10 @@
 #include <sys/sysctl.h>
 
 #include <libjailbreak/libjailbreak.h>
+#include <libjailbreak/jbserver.h>
 #include <libjailbreak/roothider.h>
 #include <libjailbreak/roothider/xpc_hook.h>
+#include <libjailbreak/roothider/bootlog.h>
 
 #include "../systemhook/src/common/common.h"
 #include "../systemhook/src/common/envbuf.h"
@@ -91,8 +93,14 @@ void roothide_launchd_preinit()
 	exec_set_patch(false);
 }
 
+static int jailbreakd_bootstrap_dispatch(xpc_object_t message)
+{
+	return jbserver_received_xpc_message(&gGlobalServer, message);
+}
+
 void roothide_launchd_postinit(bool firstLoad)
 {
+	roothide_bootlog(firstLoad ? "launchd: first roothide initialization" : "launchd: reboot roothide initialization");
 	JBLogDebug("roothide_launchd_postinit: firstLoad=%d", firstLoad);
 
 	launchdhookFirstLoad = firstLoad;
@@ -128,7 +136,9 @@ void roothide_launchd_postinit(bool firstLoad)
 			assert([NSFileManager.defaultManager moveItemAtPath:JBROOT_PATH(@"/basebin/systemhook.dylib") toPath:systemhookFilePath error:nil]);
 		}
 		
+		roothide_bootlog("launchd: publishing systemhook namecache entry");
 		assert(unsandbox("/usr/lib", systemhookFilePath.fileSystemRepresentation) == 0);
+		roothide_bootlog("launchd: systemhook namecache entry published");
 
 		//new "real path"
 		asprintf(&HOOK_DYLIB_PATH, "/usr/lib/systemhook-%016llX.dylib", jbinfo(jbrand));
@@ -168,7 +178,9 @@ void roothide_launchd_postinit(bool firstLoad)
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, xpc_pipe_routine_reply, new_xpc_pipe_routine_reply, NULL);
 
 	// load jailbreakd after applying hooks
-	assert(initJailbreakd(firstLoad) == 0);
+	roothide_bootlog("launchd: starting jailbreakd");
+	assert(initJailbreakd(firstLoad, jailbreakd_bootstrap_dispatch) == 0);
+	roothide_bootlog("launchd: jailbreakd spawn returned");
 }
 
 #include <dlfcn.h>
@@ -318,6 +330,11 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 
 	if(!path) {
 		return __posix_spawn_hook(pidp, path, desc, argv, envp);
+	}
+
+	// The credential donor is prepared explicitly while stopped, independent of global dyld settings.
+	if (envbuf_getenv((const char **)envp, "DYLD_HOOK_SETUID")) {
+		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
 	}
 
 	// hookd must be able to restart without depending on child patching or its own IPC service.

@@ -2,6 +2,7 @@
 #import "carboncopy.h"
 #import "codesign.h"
 #import "util.h"
+#import "roothider/bootlog.h"
 #import <Foundation/Foundation.h>
 #import <sys/sysctl.h>
 
@@ -89,7 +90,9 @@ int apply_dyld_patch(NSString *dyldPath, const char *newUUIDPrefix)
 
 int merge_dyldhook(NSString *originalDyldPath, NSString *dyldhookMergeDylibPath, NSString *outPath)
 {
+	roothide_bootlog("generator: starting MachOMerger");
 	int r = exec_cmd(JBROOT_PATH("/basebin/MachOMerger"), originalDyldPath.fileSystemRepresentation, dyldhookMergeDylibPath.fileSystemRepresentation, outPath.fileSystemRepresentation, NULL);
+	roothide_bootlog("generator: MachOMerger returned");
 	if (r == 0) {
 		r = chmod(outPath.fileSystemRepresentation, 0755);
 	}
@@ -98,6 +101,7 @@ int merge_dyldhook(NSString *originalDyldPath, NSString *dyldhookMergeDylibPath,
 
 int basebin_generate_internal(NSString *originUsrLibPath, NSString *basebinPath, NSString *targetBasebinPath, bool comingFromJBUpdate)
 {
+	roothide_bootlog("generator: selecting linker variant");
 	NSString *dyldhookMergeDylibName = dyldhook_dylib_for_platform();
 	if (!dyldhookMergeDylibName) {
 		printf("Error: Failed to locate dyldhook.dylib\n");
@@ -126,12 +130,15 @@ int basebin_generate_internal(NSString *originUsrLibPath, NSString *basebinPath,
 	if (!dopamineVersion) return 1;
 
 	[[NSFileManager defaultManager] createDirectoryAtPath:genPath withIntermediateDirectories:YES attributes:nil error:nil];
+	roothide_bootlog("generator: generation directory prepared");
 
 	if (!comingFromJBUpdate) {
 		// Copy /usr/lib to /var/jb/basebin/.fakelib
 		[[NSFileManager defaultManager] removeItemAtPath:fakelibPath error:nil];
 		[[NSFileManager defaultManager] createDirectoryAtPath:fakelibPath withIntermediateDirectories:YES attributes:nil error:nil];
+		roothide_bootlog("generator: copying system libraries");
 		carbonCopy(originUsrLibPath, fakelibPath);
+		roothide_bootlog("generator: system libraries copied");
 
 		// Delete the dyld inside .fakelib
 		[[NSFileManager defaultManager] removeItemAtPath:fakelibDyldPath error:nil];
@@ -144,14 +151,19 @@ int basebin_generate_internal(NSString *originUsrLibPath, NSString *basebinPath,
 
 		// Backup original dyld
 		carbonCopy(dyldPath, dyldOrigPath);
+		roothide_bootlog("generator: original linker copied");
 	}
 
 	carbonCopy(dyldOrigPath, dyldInflightPath);
+	roothide_bootlog("generator: inflight linker copied");
 
 	NSString *dyldUUIDPrefix = [@"DOPA" stringByAppendingString:dopamineVersion];
 	if (apply_dyld_patch(dyldInflightPath, dyldUUIDPrefix.UTF8String) != 0) return 2;
+	roothide_bootlog("generator: linker policy patched");
 	if (merge_dyldhook(dyldInflightPath, dyldhookMergeDylibPath, dyldInflightPath) != 0) return 3;
+	roothide_bootlog("generator: signing linker");
 	if (resign_file(dyldInflightPath, @"com.apple.dyld", YES) != 0) return 4;
+	roothide_bootlog("generator: linker signed");
 
 	if (comingFromJBUpdate) {
 		// We cannot delete dyld as this point because it's still in use
@@ -166,6 +178,7 @@ int basebin_generate_internal(NSString *originUsrLibPath, NSString *basebinPath,
 	}
 
 	[[NSFileManager defaultManager] moveItemAtPath:dyldInflightPath toPath:dyldPatchedPath error:nil];
+	roothide_bootlog("generator: linker published");
 	return 0;
 }
 

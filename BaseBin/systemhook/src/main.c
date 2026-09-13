@@ -1,5 +1,6 @@
 #include "common/common.h"
 #include "roothider.h"
+#include "image_symbols.h"
 
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
@@ -10,6 +11,7 @@
 #include <util.h>
 #include <ptrauth.h>
 #include <libjailbreak/jbclient_xpc.h>
+#include <libjailbreak/jbclient_mach.h>
 #include <libjailbreak/codesign.h>
 #include <libjailbreak/jbroot.h>
 #include <libjailbreak/hookd.h>
@@ -359,6 +361,20 @@ int parse_dyldhook_jbinfo(char **jbRootPathOut, char **bootUUIDOut, char **sandb
 	return 0;
 }
 
+static int systemhook_checkin(void)
+{
+	static struct jbserver_mach_msg_checkin_reply info;
+	// WebContent can reject the legacy XPC message before its first check-in completes.
+	int result = jbclient_mach_process_checkin(info.jbRootPath, info.bootUUID,
+		info.sandboxExtensions, &info.fullyDebugged, NULL);
+	if (result != 0) return result;
+	JB_RootPath = info.jbRootPath;
+	JB_BootUUID = info.bootUUID;
+	JB_SandboxExtensions = info.sandboxExtensions;
+	gFullyDebugged = info.fullyDebugged;
+	return 0;
+}
+
 __attribute__((constructor)) static void initializer(void)
 {
 	roothide_init();
@@ -367,7 +383,7 @@ __attribute__((constructor)) static void initializer(void)
 	if (parse_dyldhook_jbinfo(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged) != 0) {
 		// If under any circumstances dyldhook has *not* performed a check-in, do it now
 		// This code path is taken inside xpcproxy on iOS 16, because launchd apparently no longer passes it a bootstrap port
-		if (jbclient_process_checkin(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged, NULL) == 0) {
+		if (systemhook_checkin() == 0) {
 			consume_tokenized_sandbox_extensions(JB_SandboxExtensions);
 		}
 		else {
@@ -398,7 +414,7 @@ __attribute__((constructor)) static void initializer(void)
 		// - Implement inline mach_msg* syscalls into systemhook
 		// - Refactor all logic involving hookd into it's own library and implement the inline syscalls there
 		// But for now this works, the only problem could be something trying to hook a page in dyld itself....
-		void *dyld_jbclient_mach_hookd_send_msg = litehook_find_symbol(get_dyld_mach_header(), "_jbclient_mach_hookd_send_msg");
+		void *dyld_jbclient_mach_hookd_send_msg = systemhook_find_image_symbol(get_dyld_mach_header(), "_jbclient_mach_hookd_send_msg");
 		if (dyld_jbclient_mach_hookd_send_msg) {
 			hookd_send_msg = dyld_jbclient_mach_hookd_send_msg;
 		}
@@ -428,9 +444,9 @@ __attribute__((constructor)) static void initializer(void)
 
 	// Hook the dyld_shared_cache __fcntl to jump to the dyld __fcntl instead
 	// This makes it so that library validation is also bypassed if someone calls fcntl in userspace to attach a signature manually
-	void *dyld___fcntl = litehook_find_symbol(get_dyld_mach_header(), "___fcntl");
+	void *dyld___fcntl = systemhook_find_image_symbol(get_dyld_mach_header(), "___fcntl");
 	extern int __fcntl(int fd, int op, ... /* arg */ );
-	litehook_hook_function(__fcntl, dyld___fcntl);
+	if (dyld___fcntl) litehook_hook_function(__fcntl, dyld___fcntl);
 
 	// Initialize stuff neccessary for sandbox_apply hook
 	gLibSandboxHandle = dlopen("/usr/lib/libsandbox.1.dylib", RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY);

@@ -277,18 +277,19 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 			int ruid = kread32(ucred + koffsetof(ucred, ruid)), rgid = kread32(ucred + koffsetof(ucred, rgid));
 			int old_uid = uid, old_gid = gid;
 
-			if ((sb.st_mode & (S_ISUID))) {
-				kwrite32(proc + koffsetof(proc, svuid), sb.st_uid);
-				uid = sb.st_uid;
-			}
-			if ((sb.st_mode & (S_ISGID))) {
-				kwrite32(proc + koffsetof(proc, svgid), sb.st_gid);
-				gid = sb.st_gid;
-			}
+				if ((sb.st_mode & (S_ISUID))) {
+					uid = sb.st_uid;
+				}
+				if ((sb.st_mode & (S_ISGID))) {
+					gid = sb.st_gid;
+					groups[0] = gid;
+				}
 
-			if (old_uid != uid || old_gid != gid) {
-				proc_ucred_update_content(proc, procPath, uid, gid, ruid, rgid, groups);
-			}
+				if (old_uid != uid || old_gid != gid) {
+					if (proc_ucred_update_content(proc, procPath, uid, gid, ruid, rgid, groups) != 0) return -1;
+				}
+				if (sb.st_mode & S_ISUID) kwrite32(proc + koffsetof(proc, svuid), uid);
+				if (sb.st_mode & S_ISGID) kwrite32(proc + koffsetof(proc, svgid), gid);
 
 			uint32_t flag = kread32(proc + koffsetof(proc, flag));
 			if ((flag & P_SUGID) != 0) {
@@ -561,17 +562,17 @@ static int systemwide_persona_fix(audit_token_t *callerToken, int childPid, uid_
 
 	if (overwriteUid != -1) {
 		uid = overwriteUid;
-		kwrite32(childProc + koffsetof(proc, svuid), uid);
 	}
 	if (overwriteGid != -1) {
 		gid = overwriteGid;
-		kwrite32(childProc + koffsetof(proc, svgid), gid);
 	}
 
 	if (old_uid != uid || old_gid != gid) {
 		if (old_gid != gid) groups[0] = gid;
-		proc_ucred_update_content(childProc, childProcPath, uid, gid, uid, gid, groups);
+		if (proc_ucred_update_content(childProc, childProcPath, uid, gid, uid, gid, groups) != 0) return -1;
 	}
+	if (overwriteUid != -1) kwrite32(childProc + koffsetof(proc, svuid), uid);
+	if (overwriteGid != -1) kwrite32(childProc + koffsetof(proc, svgid), gid);
 
 	return 0;
 }

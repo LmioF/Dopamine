@@ -3,6 +3,7 @@
 #import <libjailbreak/util.h>
 #import <libjailbreak/kernel.h>
 #import <libjailbreak/display.h>
+#import <libjailbreak/roothider/bootlog.h>
 #import <mach-o/dyld.h>
 #import <os/alloc_once_private.h>
 #import <dlfcn.h>
@@ -103,6 +104,7 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 
 __attribute__((constructor)) static void initializer(void)
 {
+	roothide_bootlog("launchd: initializer begin");
 	crashreporter_start();
 
 /********** roothide specfic ********/
@@ -151,6 +153,7 @@ __attribute__((constructor)) static void initializer(void)
 	}
 
 	int err = boomerang_recoverPrimitives(firstLoad, true);
+	roothide_bootlog("launchd: primitive recovery returned");
 	if (err != 0) {
 		char msg[1000];
 		snprintf(msg, 1000, "Dopamine: Failed to recover primitives (error %d), cannot continue.", err);
@@ -168,17 +171,21 @@ __attribute__((constructor)) static void initializer(void)
 
 	if (__builtin_available(iOS 19.0, *)) {
 		// On iOS 26+, hooks have to be applied through hookd
+		roothide_bootlog("launchd: hookd initialization begin");
 		hookd_provider_init();
 		litehook_hook_memory = litehook_hook_memory_hookd;
 		litehook_hook_function(mach_vm_protect, mach_vm_protect_fixed);
 		init_hookd_external_support();
+		roothide_bootlog("launchd: hookd initialization complete");
 	}
 
+	roothide_bootlog("launchd: installing service hooks");
 	initXPCHooks();
 	initDaemonHooks();
 	initSpawnHooks();
 	initIPCHooks();
 	initJetsamHook();
+	roothide_bootlog("launchd: service hooks installed");
 
 	sysctlbyname_orig = sysctlbyname;
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)sysctlbyname_hook, NULL);
@@ -215,5 +222,6 @@ __attribute__((constructor)) static void initializer(void)
 
 /********** roothide specfic ********/
 roothide_launchd_postinit(firstLoad);
+roothide_bootlog("launchd: initializer complete");
 /********** roothide specfic ********/
 }

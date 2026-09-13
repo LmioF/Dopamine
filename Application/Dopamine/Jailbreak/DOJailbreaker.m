@@ -32,6 +32,7 @@
 #import <libjailbreak/jbclient_mach.h>
 #import <libjailbreak/kcall_arm64.h>
 #import <libjailbreak/basebin_gen.h>
+#import <libjailbreak/roothider/bootlog.h>
 #import <CoreServices/LSApplicationProxy.h>
 #import <sys/utsname.h>
 #import "spawn.h"
@@ -403,6 +404,14 @@ void *boomerang_server(struct boomerang_info *info)
 
 - (NSError *)injectLaunchdHook
 {
+    if (getenv("DOPAMINE_DIAGNOSTICS")) {
+        int diagnosticFd = open(ROOTHIDE_BOOTLOG_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+        if (diagnosticFd >= 0) {
+            fchown(diagnosticFd, 501, 501);
+            close(diagnosticFd);
+        }
+    }
+    roothide_bootlog("app: launchd injection begin");
     // Host a boomerang server that will be used by launchdhook to get the jailbreak primitives from this app
     mach_port_t serverPort = MACH_PORT_NULL;
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &serverPort);
@@ -437,12 +446,14 @@ void *boomerang_server(struct boomerang_info *info)
 
     // Inject launchdhook.dylib into launchd via opainject
     int r = exec_cmd(JBROOT_PATH("/basebin/opainject"), "1", JBROOT_PATH("/basebin/launchdhook.dylib"), NULL);
+    roothide_bootlog("app: opainject returned");
     if (r != 0) {
         return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"opainject failed with error code %d", r]}];
     }
 
     // Wait for everything to finish
     dispatch_semaphore_wait(info.boomerangDone, DISPATCH_TIME_FOREVER);
+    roothide_bootlog("app: launchd primitive transfer complete");
     mach_port_deallocate(mach_task_self(), serverPort);
 
     return nil;
@@ -726,8 +737,10 @@ void *boomerang_server(struct boomerang_info *info)
     [[DOEnvironmentManager sharedManager] setJailbroken:YES withVersion:[NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil]];
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"RootHide Stage") debug:NO];
+    roothide_bootlog("app: basebin generation begin");
     int ret = basebin_generate(false);
     if (ret == 0) ret = ensure_dyld_trustcache(JBROOT_PATH("/basebin/.fakelib/dyld"));
+    roothide_bootlog("app: basebin generation returned");
     if (ret != 0) {
         *errOut = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedInitFakeLib userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Preparing roothide dyld failed: %d", ret]}];
         [self cleanUpPostExploitation];
@@ -741,8 +754,10 @@ void *boomerang_server(struct boomerang_info *info)
 
     // Unsandbox iconservicesagent so that app icons can work
     exec_cmd_trusted(JBROOT_PATH("/usr/bin/killall"), "-9", "iconservicesagent", NULL);
+    roothide_bootlog("app: iconservices restart returned");
     
     *errOut = [self finalizeBootstrapIfNeeded];
+    roothide_bootlog("app: bootstrap finalization returned");
     if (*errOut) {
         [self cleanUpPostExploitation];
         return;
@@ -752,11 +767,13 @@ void *boomerang_server(struct boomerang_info *info)
     
     *errOut = [self cleanUpPostExploitation];
 
+    roothide_bootlog("app: post-exploitation cleanup returned");
     printf("Done!\n");
 }
 
 - (void)finalize
 {
+    roothide_bootlog("app: requesting userspace reboot");
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Rebooting Userspace") debug:NO];
     [[DOEnvironmentManager sharedManager] rebootUserspace];
 }

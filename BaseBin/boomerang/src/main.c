@@ -1,4 +1,7 @@
 #include <mach/mach.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
 #include <libjailbreak/primitives.h>
 #include <libjailbreak/libjailbreak.h>
 #include <libjailbreak/physrw.h>
@@ -10,9 +13,11 @@
 #include <libjailbreak/stock_fixes.h>
 
 #include <libjailbreak/roothider.h>
+#include <libjailbreak/roothider/bootlog.h>
 
 int main(int argc, char* argv[])
 {
+	roothide_bootlog("boomerang: start");
 	crashreporter_start();
 	JBLogDebug("Boomerang started");
 
@@ -57,15 +62,50 @@ int main(int argc, char* argv[])
 
 	// Retrieve primitives
 	jbclient_initialize_primitives_internal(false);
+	roothide_bootlog("boomerang: primitive acquisition returned");
 
 	// Send done message to launchd
 	jbclient_boomerang_done();
+	roothide_bootlog("boomerang: transfer completion sent");
 
 
 /******************* roothide specific **********************/
 // patch new launchd process
-if(unrestrict(1, roothide_patch_proc, true) != 0) {
+roothide_bootlog("boomerang: waiting to patch new launchd");
+if(unrestrict(1, roothide_patch_proc, false) != 0) {
 	JBLogError("Failed to unrestrict launchd");
+	return -1;
+}
+roothide_bootlog("boomerang: new launchd patched");
+
+launchdTaskPort = MACH_PORT_NULL;
+kr = task_for_pid(mach_task_self(), 1, &launchdTaskPort);
+if (kr != KERN_SUCCESS || !MACH_PORT_VALID(launchdTaskPort)) {
+	roothide_bootlog("boomerang: failed to acquire reexec task");
+	return -1;
+}
+
+int signalResult = kill(1, SIGCONT);
+int signalError = signalResult == 0 ? 0 : errno;
+mach_task_basic_info_data_t taskInfo = {0};
+mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
+kr = task_info(launchdTaskPort, MACH_TASK_BASIC_INFO, (task_info_t)&taskInfo, &infoCount);
+if (kr == KERN_SUCCESS && taskInfo.suspend_count > 0) {
+	// A successful SIGCONT does not prove the re-executed Mach task is runnable.
+	kr = task_resume(launchdTaskPort);
+	if (kr == KERN_SUCCESS) {
+		infoCount = MACH_TASK_BASIC_INFO_COUNT;
+		kr = task_info(launchdTaskPort, MACH_TASK_BASIC_INFO, (task_info_t)&taskInfo, &infoCount);
+		if (kr == KERN_SUCCESS && taskInfo.suspend_count != 0) kr = KERN_FAILURE;
+	}
+}
+mach_port_deallocate(mach_task_self(), launchdTaskPort);
+char resumePhase[160];
+snprintf(resumePhase, sizeof(resumePhase), "boomerang: launchd resume signal=%d errno=%d kr=%d suspended=%d",
+	signalResult, signalError, kr, taskInfo.suspend_count);
+roothide_bootlog(resumePhase);
+if (kr != KERN_SUCCESS) {
+	JBLogError("Failed to resume launchd: %d", kr);
 	return -1;
 }
 /******************* roothide specific **********************/

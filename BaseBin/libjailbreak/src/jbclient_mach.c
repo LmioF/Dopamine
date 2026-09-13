@@ -1,4 +1,5 @@
 #include "jbclient_mach.h"
+#include "mach_msg_exchange.h"
 #include <dispatch/dispatch.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -45,14 +46,9 @@ kern_return_t jbclient_mach_send_msg(mach_msg_header_t *hdr, struct jbserver_mac
 	hdr->msgh_id           = 0x40000000 | 206;
 	// 206: magic value to make WebContent work (seriously, this is the only ID that the WebContent sandbox allows)
 	
-	kern_return_t kr = mach_msg(hdr, MACH_SEND_MSG, hdr->msgh_size, 0, 0, 0, 0);
-	if (kr != KERN_SUCCESS) {
-		mach_port_deallocate(mach_task_self(), launchdPort);
-		return kr;
-	}
-	
 	reply->status = -1;
-	kr = mach_msg(&reply->msg.hdr, MACH_RCV_MSG, 0, reply->msg.hdr.msgh_size, replyPort, 0, 0);
+	// A hookd request can temporarily remove execute permission from this syscall wrapper.
+	kern_return_t kr = jb_mach_msg_exchange(hdr, &reply->msg.hdr, replyPort);
 	if (kr != KERN_SUCCESS) {
 		mach_port_deallocate(mach_task_self(), launchdPort);
 		return kr;

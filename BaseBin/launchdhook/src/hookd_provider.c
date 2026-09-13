@@ -3,6 +3,7 @@
 #include <libjailbreak/libjailbreak.h>
 #include <libjailbreak/hookd.h>
 #include <libjailbreak/inline_svc.h>
+#include <libjailbreak/mach_msg_exchange.h>
 #include <spawn.h>
 #include <signal.h>
 #include <errno.h>
@@ -32,17 +33,20 @@ int hookd_start(pid_t *pid, mach_port_t *machPort)
 		return r;
 	}
 
-	mach_msg_header_t hdr = { 0 };
-	hdr.msgh_size = sizeof(hdr) + MAX_TRAILER_SIZE;
-	kern_return_t kr = mach_msg(&hdr, MACH_RCV_MSG, 0, hdr.msgh_size, checkinPort, 0, 0);
+	struct {
+		mach_msg_header_t hdr;
+		uint8_t trailer[MAX_TRAILER_SIZE];
+	} message = { 0 };
+	message.hdr.msgh_size = sizeof(message);
+	kern_return_t kr = mach_msg(&message.hdr, MACH_RCV_MSG, 0, sizeof(message), checkinPort, 0, 0);
 	if (kr != KERN_SUCCESS) {
 		return kr;
 	}
 
-	gHookdPort = hdr.msgh_remote_port;
+	gHookdPort = message.hdr.msgh_remote_port;
 	mach_port_mod_refs(mach_task_self(), gHookdPort, MACH_PORT_RIGHT_SEND, 1);
 
-	mach_msg_destroy(&hdr);
+	mach_msg_destroy(&message.hdr);
 	mach_port_deallocate(mach_task_self(), checkinPort);
 
 	return 0;
@@ -70,10 +74,9 @@ static int launchd_hookd_send_msg(struct hookd_mach_msg *msg, struct hookd_mach_
 	msg->hdr.msgh_voucher_port = 0;
 	msg->hdr.msgh_id           = 0x40000000;
 
-	kern_return_t kr = mach_msg(&msg->hdr, MACH_SEND_MSG, msg->hdr.msgh_size, 0, 0, 0, 0);
-	if (kr != KERN_SUCCESS) return kr;
-	
-	kr = mach_msg(&reply->hdr, MACH_RCV_MSG, 0, reply->hdr.msgh_size, replyPort, 0, 0);
+	// The syscall wrapper may share the page hookd temporarily makes non-executable.
+	// Stay in the kernel until hookd restores that page and sends its reply.
+	kern_return_t kr = jb_mach_msg_exchange(&msg->hdr, &reply->hdr, replyPort);
 	if (kr != KERN_SUCCESS) return kr;
 
 	mach_msg_destroy(&reply->hdr);

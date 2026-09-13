@@ -1,5 +1,6 @@
 #include "jbserver.h"
 #include "util.h"
+#include <errno.h>
 
 #include "roothider.h"
 
@@ -88,7 +89,9 @@ int jbserver_received_xpc_message(struct jbserver_impl *server, xpc_object_t xms
 		}
 	}
 
+	errno = 0;
 	int result = handler(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+	int handlerErrno = errno;
 
 	xpc_object_t xreply = xpc_dictionary_create_reply(xmsg);
 	for (uint64_t i = 0; action->args[i].name && i < 8; i++) {
@@ -150,6 +153,7 @@ int jbserver_received_xpc_message(struct jbserver_impl *server, xpc_object_t xms
 		}
 	}
 	xpc_dictionary_set_int64(xreply, "result", result);
+	if (result != 0) xpc_dictionary_set_int64(xreply, "error-number", handlerErrno);
 	xpc_pipe_routine_reply(xreply);
 	xpc_release(xreply);
 

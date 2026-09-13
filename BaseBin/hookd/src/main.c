@@ -5,6 +5,7 @@
 #include <libjailbreak/hookd.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+#include <unistd.h>
 
 mach_port_t extract_task_port(mach_port_t clientTaskPort, mach_port_t callerPort)
 {
@@ -37,35 +38,29 @@ int apply_hook(mach_port_t clientTaskPort, mach_port_t taskPortInClient, vm_addr
 		return -1;
 	}
 
-	// char pathbuf[PROC_PIDPATHINFO_MAXSIZE];
-	// pid_t taskPortPid = 0;
-	// pid_for_task(taskPort, &taskPortPid);
-	// if (proc_pidpath (taskPortPid, pathbuf, sizeof(pathbuf)) <= 0) {
-	// 	strlcpy(pathbuf, "<unknown>", sizeof(pathbuf));
-	// }
-	// printf("Applying hook with size %zu at %#llx in [pid=%d,path=%s]\n", size, vmaddr, taskPortPid, pathbuf);
-
-	kern_return_t kr = vm_protect(taskPort, vmaddr, size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-	if (kr != KERN_SUCCESS) {
-		// printf("Failed to make %lx->%#lx in task %d writable (%d)\n", vmaddr, vmaddr+size, taskPort, kr); fflush(stdout);
-		mach_port_mod_refs(mach_task_self(), taskPort, MACH_PORT_RIGHT_SEND, -1);
-		return kr;
+	pid_t targetPid = 0;
+	kern_return_t kr = pid_for_task(taskPort, &targetPid);
+	if (kr != KERN_SUCCESS) goto release;
+	if (targetPid == getpid()) {
+		kr = KERN_INVALID_ARGUMENT;
+		goto release;
 	}
 
-	kr = vm_write(taskPort, vmaddr, (vm_offset_t)data, (mach_msg_type_number_t)size);
-	if (kr != KERN_SUCCESS) {
-		// printf("Failed to write data at %#lx in task %d (%d)\n", (vm_offset_t)data, taskPort, kr); fflush(stdout);
+	// Other target threads must not execute the page during its non-executable interval.
+	kr = task_suspend(taskPort);
+	if (kr != KERN_SUCCESS) goto release;
+	kr = vm_protect(taskPort, vmaddr, size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr == KERN_SUCCESS) {
+		kr = vm_write(taskPort, vmaddr, (vm_offset_t)data, (mach_msg_type_number_t)size);
+		kern_return_t protectionResult = vm_protect(taskPort, vmaddr, size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+		if (protectionResult != KERN_SUCCESS) kr = protectionResult;
 	}
+	kern_return_t resumeResult = task_resume(taskPort);
+	if (kr == KERN_SUCCESS) kr = resumeResult;
 
-	kr = vm_protect(taskPort, vmaddr, size, false, VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS;
-	if (kr != KERN_SUCCESS) {
-		// printf("Failed to make %lx->%#lx in task %d executable (%d)\n", vmaddr, vmaddr+size, taskPort, kr); fflush(stdout);
-		mach_port_mod_refs(mach_task_self(), taskPort, MACH_PORT_RIGHT_SEND, -1);
-		return kr;
-	}
-
+release:
 	mach_port_mod_refs(mach_task_self(), taskPort, MACH_PORT_RIGHT_SEND, -1);
-	return KERN_SUCCESS;
+	return kr;
 }
 
 int apply_fixup(mach_port_t clientTaskPort, mach_port_t taskPortInClient, vm_address_t address, vm_size_t size, bool set_maximum, vm_prot_t prot)

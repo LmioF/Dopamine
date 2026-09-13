@@ -62,10 +62,13 @@ void loadPathHook()
 {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-		void* roothidehooks = dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
-		ASSERT(roothidehooks != NULL);
-		void (*pathhook)() = dlsym(roothidehooks, "pathhook");
-		ASSERT(pathhook != NULL);
+			const char *path = JBROOT_PATH("/basebin/roothidehooks.dylib");
+			void* roothidehooks = dlopen(path, RTLD_NOW);
+			if (!roothidehooks) fprintf(stderr, "Loading path hooks failed for %s: %s\n", path, dlerror() ?: "no dyld error");
+			ASSERT(roothidehooks != NULL);
+			void (*pathhook)() = dlsym(roothidehooks, "pathhook");
+			if (!pathhook) fprintf(stderr, "Resolving pathhook failed for %s: %s\n", path, dlerror() ?: "no dyld error");
+			ASSERT(pathhook != NULL);
 		pathhook();
 	});
 }

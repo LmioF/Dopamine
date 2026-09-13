@@ -1,9 +1,23 @@
 #include <Foundation/Foundation.h>
 #include <bsm/libbsm.h>
 #include <libproc.h>
+#include <errno.h>
+#include <time.h>
 
 #include <libjailbreak/libjailbreak.h>
 #include <libjailbreak/roothider.h>
+
+static int prepareCredentialHelper(pid_t clientPid, pid_t pid, int pidversion, uint64_t deadline)
+{
+	if (clientPid != 1 || pid <= 1 || proc_get_ppid(pid) != clientPid) return EPERM;
+	if (pidversion <= 0 || proc_get_pidversion(pid) != pidversion) return ESRCH;
+	if (clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) return ETIMEDOUT;
+	bool paused = false;
+	if (proc_paused(pid, &paused) != 0) return ESRCH;
+	if (!paused) return EBUSY;
+	// Unlike launchd, this service has the task-port and thread-state entitlements.
+	return proc_patch_dyld(pid) == 0 ? 0 : EIO;
+}
 
 void jailbreakd_reply_message(JBD_MESSAGE_ID msgId, xpc_object_t reply)
 {
@@ -40,8 +54,16 @@ void jailbreakd_received_message(mach_port_t port)
 			JBLogDebug("received message %d from %d(%s) with dictionary: %s", msgId, clientPid, proc_get_path(clientPid,NULL), (desc=xpc_copy_description(message)));
 			if(desc) free(desc);
 
-			switch (msgId) {
-				case JBD_MSG_SPINLOCK_FIX_ONLY: {
+				switch (msgId) {
+					case JBD_MSG_PREPARE_CREDENTIAL_HELPER: {
+						pid_t pid = xpc_dictionary_get_int64(message, "pid");
+						int pidversion = xpc_dictionary_get_int64(message, "pidversion");
+						uint64_t deadline = xpc_dictionary_get_uint64(message, "deadline");
+						int result = prepareCredentialHelper(clientPid, pid, pidversion, deadline);
+						xpc_dictionary_set_int64(reply, "result", result);
+						break;
+					}
+					case JBD_MSG_SPINLOCK_FIX_ONLY: {
 					int64_t result = 0;
 					pid_t pid = xpc_dictionary_get_int64(message, "pid");
 					bool resume = xpc_dictionary_get_bool(message, "resume");

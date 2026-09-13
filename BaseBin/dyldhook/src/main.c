@@ -168,17 +168,17 @@ void dyldhook_init(uintptr_t kernelParams)
 
 		if (fd == -1) return;
 
-		setgid(gid);
-		setgid(gid);
-		setregid(rgid, -1);
+		int credentialResult = setgid(gid);
+		credentialResult |= setgid(gid);
+		credentialResult |= setregid(rgid, -1);
 		int ngroups;
 		for (ngroups = 0; ngroups < NGROUPS_MAX; ngroups++) {
 			if (groups[ngroups] == -1) break;
 		}
-		setgroups(ngroups, groups);
-		setuid(uid);
-		setuid(uid);
-		setreuid(ruid, -1);
+		credentialResult |= setgroups(ngroups, groups);
+		credentialResult |= setuid(uid);
+		credentialResult |= setuid(uid);
+		credentialResult |= setreuid(ruid, -1);
 
 		// if (gDyldHookLog) {
 		// 	uid_t uid  = getuid();
@@ -192,7 +192,7 @@ void dyldhook_init(uintptr_t kernelParams)
 		// 	_simple_dprintf(2, "gid  : real=%d  effective=%d\n", (int)gid,  (int)egid);
 		// }
 
-		char r = 0x42;
+		char r = credentialResult == 0 ? 0x42 : 0;
 		write(fd, &r, sizeof(r));
 
 		__asm("b .");

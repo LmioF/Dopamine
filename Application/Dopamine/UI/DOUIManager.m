@@ -11,6 +11,8 @@
 #import "DOTheme.h"
 #import "NSString+Version.h"
 #import <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 @implementation DOUIManager
 
@@ -212,6 +214,22 @@
     [_logLock lock];
 
     [self.logRecord addObject:log];
+
+    static FILE *diagnosticLog;
+    static dispatch_once_t diagnosticOnce;
+    dispatch_once(&diagnosticOnce, ^{
+        if (getenv("DOPAMINE_DIAGNOSTICS")) {
+            NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/last-jailbreak.log"];
+            diagnosticLog = fopen(path.fileSystemRepresentation, "w");
+            if (diagnosticLog) {
+                fprintf(diagnosticLog, "Dopamine diagnostic build %s\n", [[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] UTF8String]);
+            }
+        }
+    });
+    if (diagnosticLog) {
+        fprintf(diagnosticLog, "%s\n", log.UTF8String);
+        fflush(diagnosticLog);
+    }
 
     BOOL isDebug = self.logView.class == DODebugLogView.class;
     if (debug && !isDebug) {

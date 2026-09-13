@@ -2,6 +2,7 @@
 #define JAILBREAKD_H
 
 #include <unistd.h>
+#include <xpc/xpc.h>
 
 typedef enum {
 	JBD_MSG_TEST_CALL = 101,
@@ -12,11 +13,12 @@ typedef enum {
 	JBD_MSG_EXEC_TRACE_START = 1004,
 	JBD_MSG_EXEC_TRACE_CANCEL = 1005,
 	JBD_MSG_SPINLOCK_FIX_ONLY = 1006,
+	JBD_MSG_PREPARE_CREDENTIAL_HELPER = 1007,
 } JBD_MESSAGE_ID;
 
 void enableJBDLog(void* debugLog, void* errorLog);
 
-int initJailbreakd(bool firstLoad);
+int initJailbreakd(bool firstLoad, int (*bootstrapHandler)(xpc_object_t));
 
 void setJailbreakdProcess(pid_t pid);
 
@@ -27,6 +29,7 @@ int jbdTestCall(int value);
 int jbdSystemwideLog(const char* fmt, ...);
 
 int jbdSpawnPatchChild(int pid, bool resume);
+int jbdPrepareCredentialHelper(int pid, int pidversion, uint64_t deadline);
 int jbdSpawnExecStart(const char* execfile, bool resume);
 int jbdSpawnExecCancel(const char* execfile);
 int jbdExecTraceStart(const char* execfile, bool* traced);

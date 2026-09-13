@@ -79,6 +79,11 @@ jobs:
           mv ./Application/Dopamine.tipa  "./Application/roothide-Dopamine-${VERSION}.tipa"
           echo "version=${VERSION}" >> $GITHUB_ENV
 
+      - name: Check BaseBin dependency paths
+        run: |
+          test -f BaseBin/roothidehooks/.theos/obj/roothidehooks.dylib
+          python3 -m unittest discover -s tests -p test_basebin_linkage.py -v
+
       - name: Upload Artifact
         id: dopamine-latest-upload
         uses: actions/upload-artifact@v4

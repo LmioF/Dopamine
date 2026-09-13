@@ -2,6 +2,7 @@
 #include "jbclient_mach.h"
 #include "jbserver.h"
 #include <dispatch/dispatch.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <pthread.h>
@@ -64,6 +65,7 @@ xpc_object_t jbserver_xpc_send_dict(xpc_object_t xdict)
 	int err = xpc_pipe_routine_with_flags(xpipe, xdict, &xreply, 0);
 	xpc_release(xpipe);
 	if (err != 0) {
+		fprintf(stderr, "Jailbreak RPC transport failed: domain=%llu action=%llu error=%d\n", xpc_dictionary_get_uint64(xdict, "jb-domain"), xpc_dictionary_get_uint64(xdict, "action"), err);
 		return NULL;
 	}
 	return xreply;
@@ -140,16 +142,24 @@ int jbclient_trust_file(int fd, struct siginfo *siginfo, bool attach)
 	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
+		if (result != 0) {
+			int serverErrno = (int)xpc_dictionary_get_int64(xreply, "error-number");
+			fprintf(stderr, "Trust request failed: fd=%d result=%lld server errno=%d (%s)\n", fd, result, serverErrno, strerror(serverErrno));
+		}
 		xpc_release(xreply);
 		return result;
 	}
+	fprintf(stderr, "Trust request failed: fd=%d no server reply\n", fd);
 	return -1;
 }
 
 int jbclient_trust_file_by_path(const char *path)
 {
 	int fd = open(path, O_RDONLY);
-	if (fd < 0) return -1;
+	if (fd < 0) {
+		fprintf(stderr, "Trust path open failed: %s errno=%d (%s)\n", path, errno, strerror(errno));
+		return -1;
+	}
 
 	int r = jbclient_trust_file(fd, NULL, false);
 	close(fd);

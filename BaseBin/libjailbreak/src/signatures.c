@@ -333,7 +333,7 @@ int trust_signatures(int pid, int fd, struct siginfo *sigInfos, uint32_t sigInfo
 							free(sigInfosToAttach);
 							return -1;
 						}
-						needsAttach = !is_cdhash_trustcached(originalHash);
+							// Branding updates the embedded signature; only TXM-only mutations need detached attachment.
 						if (ksymbol(SPTMArgs)) {
 							uint32_t flags = csd_code_directory_get_flags(bestCDBlob);
 							bool hasTeamId = false;
