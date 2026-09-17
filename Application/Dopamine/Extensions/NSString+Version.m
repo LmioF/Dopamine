@@ -7,6 +7,45 @@
 
 #import <Foundation/Foundation.h>
 
+static BOOL DOVersionIsDigit(unsigned char character)
+{
+    return character >= '0' && character <= '9';
+}
+
+static int DODebianVersionOrder(unsigned char character)
+{
+    if (character == '~') return -1;
+    if (!character || DOVersionIsDigit(character)) return 0;
+    if ((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')) return character;
+    return character + 256;
+}
+
+static NSComparisonResult DOCompareDebianPart(NSString *left, NSString *right)
+{
+    const unsigned char *a = (const unsigned char *)left.UTF8String;
+    const unsigned char *b = (const unsigned char *)right.UTF8String;
+    while (*a || *b) {
+        while ((*a && !DOVersionIsDigit(*a)) || (*b && !DOVersionIsDigit(*b))) {
+            int difference = DODebianVersionOrder(*a) - DODebianVersionOrder(*b);
+            if (difference) return difference < 0 ? NSOrderedAscending : NSOrderedDescending;
+            if (*a) a++;
+            if (*b) b++;
+        }
+        while (*a == '0') a++;
+        while (*b == '0') b++;
+        int difference = 0;
+        while (DOVersionIsDigit(*a) && DOVersionIsDigit(*b)) {
+            if (!difference) difference = *a - *b;
+            a++;
+            b++;
+        }
+        if (DOVersionIsDigit(*a)) return NSOrderedDescending;
+        if (DOVersionIsDigit(*b)) return NSOrderedAscending;
+        if (difference) return difference < 0 ? NSOrderedAscending : NSOrderedDescending;
+    }
+    return NSOrderedSame;
+}
+
 @implementation NSString (Version)
 
 - (BOOL)isQualifiedVersion
@@ -29,6 +68,29 @@
         if (result != NSOrderedSame) return result;
     }
     return NSOrderedSame;
+}
+
+- (NSComparisonResult)compareDebianVersion:(NSString *)other
+{
+    NSString *left = self;
+    NSString *right = other;
+    NSRange leftColon = [left rangeOfString:@":"];
+    NSRange rightColon = [right rangeOfString:@":"];
+    NSString *leftEpoch = leftColon.location == NSNotFound ? @"0" : [left substringToIndex:leftColon.location];
+    NSString *rightEpoch = rightColon.location == NSNotFound ? @"0" : [right substringToIndex:rightColon.location];
+    NSComparisonResult result = DOCompareDebianPart(leftEpoch, rightEpoch);
+    if (result != NSOrderedSame) return result;
+    if (leftColon.location != NSNotFound) left = [left substringFromIndex:NSMaxRange(leftColon)];
+    if (rightColon.location != NSNotFound) right = [right substringFromIndex:NSMaxRange(rightColon)];
+
+    NSRange leftHyphen = [left rangeOfString:@"-" options:NSBackwardsSearch];
+    NSRange rightHyphen = [right rangeOfString:@"-" options:NSBackwardsSearch];
+    NSString *leftRevision = leftHyphen.location == NSNotFound ? @"0" : [left substringFromIndex:NSMaxRange(leftHyphen)];
+    NSString *rightRevision = rightHyphen.location == NSNotFound ? @"0" : [right substringFromIndex:NSMaxRange(rightHyphen)];
+    if (leftHyphen.location != NSNotFound) left = [left substringToIndex:leftHyphen.location];
+    if (rightHyphen.location != NSNotFound) right = [right substringToIndex:rightHyphen.location];
+    result = DOCompareDebianPart(left, right);
+    return result == NSOrderedSame ? DOCompareDebianPart(leftRevision, rightRevision) : result;
 }
 
 - (NSInteger)numericalVersionRepresentation

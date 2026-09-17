@@ -1,6 +1,7 @@
 #include "common/common.h"
 #include "roothider.h"
 #include "image_symbols.h"
+#include "dyld_dispatch.h"
 
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
@@ -18,6 +19,7 @@
 #include "../dyldhook/src/dyld_jbinfo.h"
 #include "common/hookd_external.h"
 #include <choma/CSBlob.h>
+#include <libkern/OSByteOrder.h>
 #include "litehook.h"
 #include "sandbox.h"
 #include "common/private.h"
@@ -42,28 +44,45 @@ static int load_executable_path(void)
 
 static char *JB_SandboxExtensions = NULL;
 
-void consume_tokenized_sandbox_extensions(char *sandboxExtensions)
+int consume_tokenized_sandbox_extensions(char *sandboxExtensions)
 {
-	if (sandboxExtensions[0] == '\0') return;
+	if (!sandboxExtensions || sandboxExtensions[0] == '\0') return -1;
 
-	char *it = sandboxExtensions;
-	char *last = sandboxExtensions;
-	while (*(++it) != '\0') {
+	int tokenCount = 1;
+	bool tokenHasData = false;
+	for (char *it = sandboxExtensions; *it; it++) {
 		if (*it == '|') {
-			*it = '\0';
-			sandbox_extension_consume(last);
-			last = &it[1];
-			*it = '|';
+			if (!tokenHasData) return -1;
+			tokenCount++;
+			tokenHasData = false;
+		}
+		else {
+			tokenHasData = true;
 		}
 	}
-	sandbox_extension_consume(last);
+	if (!tokenHasData || tokenCount != 3) return -1;
+
+	char *token = sandboxExtensions;
+	for (char *it = sandboxExtensions; ; it++) {
+		if (*it != '|' && *it != '\0') continue;
+		char saved = *it;
+		*it = '\0';
+		int64_t handle = sandbox_extension_consume(token);
+		*it = saved;
+		if (handle < 0) return -1;
+		if (saved == '\0') break;
+		token = &it[1];
+	}
+	return 0;
 }
 
 void *(*sandbox_apply_orig)(void *) = NULL;
 void *sandbox_apply_hook(void *a1)
 {
 	void *r = sandbox_apply_orig(a1);
-	consume_tokenized_sandbox_extensions(JB_SandboxExtensions);
+	if (consume_tokenized_sandbox_extensions(JB_SandboxExtensions) != 0) {
+		SYSLOG("Failed to reacquire sandbox extensions after sandbox_apply");
+	}
 	return r;
 }
 
@@ -75,14 +94,22 @@ int dyld_hook_routine(void **dyld, int idx, void *hook, void **orig, uint16_t pa
 	void **dyldFuncPtrs = ptrauth_auth_data(*dyld, ptrauth_key_process_independent_data, dyldPacDiversifier);
 	if (!dyldFuncPtrs) return -1;
 
-	if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE) == 0) {
+	// Shared-cache vtables require a private copy before they can become writable.
+	if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == 0) {
 		uint64_t location = (uint64_t)&dyldFuncPtrs[idx];
 		uint64_t pacDiversifier = (location & ~(0xFFFFull << 48)) | ((uint64_t)pacSalt << 48);
+		void *oldDyldTarget = dyldFuncPtrs[idx];
 
-		*orig = ptrauth_auth_and_resign(dyldFuncPtrs[idx], ptrauth_key_process_independent_code, pacDiversifier, ptrauth_key_function_pointer, 0);
+		*orig = ptrauth_auth_and_resign(oldDyldTarget, ptrauth_key_process_independent_code, pacDiversifier, ptrauth_key_function_pointer, 0);
 		dyldFuncPtrs[idx] = ptrauth_auth_and_resign(hook, ptrauth_key_function_pointer, 0, ptrauth_key_process_independent_code, pacDiversifier);
-		vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ);
-		return 0;
+		if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ) == 0) {
+			return 0;
+		}
+
+		// Do not leave a replacement published if the protection transition failed.
+		dyldFuncPtrs[idx] = oldDyldTarget;
+		vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_COPY);
+		return -1;
 	}
 
 	return -1;
@@ -102,6 +129,23 @@ void *dyld_dlsym_hook(void *dyld, void *handle, const char *name)
 		return sandbox_apply_hook;
 	}
 	__attribute__((musttail)) return dyld_dlsym_orig(dyld, handle, name);
+}
+
+static int init_dlsym_hook(void)
+{
+	void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
+	if (gDyldPtr) {
+		return dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+	}
+
+	void ***gAPIsPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gAPIsE");
+	if (!gAPIsPtr) return -1;
+
+	#ifdef __arm64e__
+	return dyld_hook_dispatch(gAPIsPtr, "_dlsym", 2, 16, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+	#else
+	return dyld_hook_routine(*gAPIsPtr, 16, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+	#endif
 }
 
 int ptrace_hook(int request, pid_t pid, caddr_t addr, int data)
@@ -275,24 +319,32 @@ xpc_object_t copy_entitlements_xpc(void)
 		}
 	}
 
-	if (hdr.length <= sizeof(hdr)) {
+	uint32_t capacity = OSSwapBigToHostInt32(hdr.length);
+	// The ERANGE size response does not contain the complete blob header.
+	if (capacity <= sizeof(hdr)) {
 		// No entitlements
 		return NULL;
 	}
 
 	// Get blob
-	void *buf = malloc(hdr.length);
+	CS_GenericBlob *buf = malloc(capacity);
 	if (!buf)
 		return NULL;
 
-	if (csops(pid, CS_OPS_ENTITLEMENTS_BLOB, buf, hdr.length) != 0) {
+	if (csops(pid, CS_OPS_ENTITLEMENTS_BLOB, buf, capacity) != 0) {
+		free(buf);
+		return NULL;
+	}
+	uint32_t length = OSSwapBigToHostInt32(buf->length);
+	if (OSSwapBigToHostInt32(buf->magic) != CSMAGIC_EMBEDDED_ENTITLEMENTS ||
+		length <= sizeof(*buf) || length > capacity) {
 		free(buf);
 		return NULL;
 	}
 
 	// Skip cs_blob header
 	const void *plist = (const uint8_t *)buf + sizeof(CS_GenericBlob);
-	size_t plist_size = hdr.length - sizeof(CS_GenericBlob);
+	size_t plist_size = length - sizeof(CS_GenericBlob);
 
 	// Convert to XPC dictionary
 	xpc_object_t obj = xpc_create_from_plist(plist, plist_size);
@@ -342,7 +394,7 @@ int parse_dyldhook_jbinfo(char **jbRootPathOut, char **bootUUIDOut, char **sandb
 	// Check if dyld LC_UUID contains dopamine magic
 	uuid_t dyldUUID;
 	if (!_dyld_get_image_uuid((const struct mach_header *)dyldHeader, dyldUUID)) return -2;
-	if (!string_has_prefix((char *)dyldUUID, "DOPA")) return -3;
+	if (memcmp(dyldUUID, "DOPA", 4) != 0) return -3;
 
 	// If so, get __jbinfo section
 	size_t jbInfoSize = 0;
@@ -383,8 +435,8 @@ __attribute__((constructor)) static void initializer(void)
 	if (parse_dyldhook_jbinfo(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged) != 0) {
 		// If under any circumstances dyldhook has *not* performed a check-in, do it now
 		// This code path is taken inside xpcproxy on iOS 16, because launchd apparently no longer passes it a bootstrap port
-		if (systemhook_checkin() == 0) {
-			consume_tokenized_sandbox_extensions(JB_SandboxExtensions);
+			if (systemhook_checkin() == 0) {
+				if (consume_tokenized_sandbox_extensions(JB_SandboxExtensions) != 0) return;
 		}
 		else {
 			// If neither dyldhook nor systemhook managed to perform the check-in, something is very wrong and the best thing we can do is bail out
@@ -422,7 +474,7 @@ __attribute__((constructor)) static void initializer(void)
 		if (process_requires_hookd()) {
 			litehook_hook_memory = litehook_hook_memory_hookd;
 			litehook_hook_function(mach_vm_protect, mach_vm_protect_fixed);
-			init_hookd_external_support();
+				if (init_hookd_external_support() != 0) return;
 		}
 	}
 
@@ -448,21 +500,14 @@ __attribute__((constructor)) static void initializer(void)
 	extern int __fcntl(int fd, int op, ... /* arg */ );
 	if (dyld___fcntl) litehook_hook_function(__fcntl, dyld___fcntl);
 
-	// Initialize stuff neccessary for sandbox_apply hook
-	gLibSandboxHandle = dlopen("/usr/lib/libsandbox.1.dylib", RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY);
-	sandbox_apply_orig = dlsym(gLibSandboxHandle, "sandbox_apply");
+		// Initialize stuff neccessary for sandbox_apply hook
+		gLibSandboxHandle = dlopen("/usr/lib/libsandbox.1.dylib", RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY);
+		if (!gLibSandboxHandle) return;
+		sandbox_apply_orig = dlsym(gLibSandboxHandle, "sandbox_apply");
+		if (!sandbox_apply_orig) return;
 
-	// Apply dyld hooks
-	void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
-	if (gDyldPtr) {
-		// TODO: Maybe we can just rebind sandbox_apply instead?
-		dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
-	} else {
-		void ***gAPIsPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gAPIsE");
-		if (gAPIsPtr) {
-			dyld_hook_routine(*gAPIsPtr, 16, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
-		}
-	}
+		// Apply dyld hooks
+		if (init_dlsym_hook() != 0) return;
 
 
 /*************************** roothide *************************/

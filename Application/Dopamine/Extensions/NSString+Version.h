@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (NSInteger)numericalVersionRepresentation;
 - (NSComparisonResult)compareVersion:(NSString *)other;
+- (NSComparisonResult)compareDebianVersion:(NSString *)other;
 - (BOOL)isQualifiedVersion;
 
 @end

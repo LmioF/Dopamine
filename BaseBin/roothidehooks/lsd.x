@@ -4,6 +4,7 @@
 #include <roothide.h>
 
 #include "common.h"
+#include "request_scope.h"
 
 extern char **environ;
 
@@ -47,8 +48,7 @@ static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 %hook _LSURLOverride
 -(id)initWithOriginalURL:(NSURL*)url
 {
-	NSNumber* tag = objc_getAssociatedObject(url, kBlockSchemeTagKey);
-	if(tag && tag.boolValue) {
+	if(rhAssociatedFlagIsActive(url, kBlockSchemeTagKey)) {
 		NSLog(@"block -[LSURLOverride initWithOriginalURL:] %@", url);
 		return nil;
 	}
@@ -67,8 +67,7 @@ static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 
 	if(_checkable || _hasHandler)
 	{
-		NSNumber* tag = objc_getAssociatedObject(url, kBlockSchemeTagKey);
-		if(tag && tag.boolValue) {
+			if(rhAssociatedFlagIsActive(url, kBlockSchemeTagKey)) {
 			NSLog(@"block -[_LSCanOpenURLManager getIsURL:alwaysCheckable:hasHandler:] %@", url);
 			_hasHandler = NO;
 			_checkable = NO;
@@ -97,18 +96,19 @@ static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 			{
 				NSLog(@"block canOpenURL:%@", url);
 
-				objc_setAssociatedObject(url, kBlockSchemeTagKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-				blocked = YES;
+					rhAssociatedFlagScopeBegin(url, kBlockSchemeTagKey);
+					blocked = YES;
 			}
 		}
 	}
 
-	BOOL ret = %orig;
-	if(blocked) {
-		assert(ret == NO);
+	BOOL ret = NO;
+	@try {
+		ret = %orig;
+	} @finally {
+		if(blocked) rhAssociatedFlagScopeEnd(url, kBlockSchemeTagKey);
 	}
-	return ret;
+	return blocked ? NO : ret;
 }
 
 %end //%hook _LSCanOpenURLManager
@@ -130,29 +130,25 @@ static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 
 		NSLog(@"_LSDOpenClient openApplicationWithIdentifier:%@ options:%@ useClientProcessHandle:%d completionHandler:%p XPCConnection=%p proc:%d,%s", identifier, options, useClientProcessHandle, completionHandler, self.XPCConnection, pid, proc_get_path(pid,NULL));
 
-		if(jbclient_blacklist_check_pid(pid)==true)
-		{
-			LSApplicationProxy* appProxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
-			if(appProxy && isJailbreakBundlePath(appProxy.bundleURL.path.fileSystemRepresentation))
+			if(jbclient_blacklist_check_pid(pid)==true)
 			{
-				NSLog(@"_LSDOpenClient: block openApplicationWithIdentifier:%@", identifier);
-
-				useClientProcessHandle = YES;
-
-				blocked = YES;
+				LSApplicationProxy* appProxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
+				if(appProxy && isJailbreakBundlePath(appProxy.bundleURL.path.fileSystemRepresentation))
+				{
+					NSLog(@"_LSDOpenClient: block openApplicationWithIdentifier:%@", identifier);
+					blocked = YES;
+				}
 			}
 		}
-	}
-
-	id newcallback = ^(BOOL success, NSError* error) {
-		NSLog(@"_LSDOpenClient completionHandler(%@) success:%d error:%@", identifier, success, error);
-
 		if(blocked) {
-			assert(success == NO);
+			if(completionHandler) completionHandler(NO, nil);
+			return;
 		}
 
-		return completionHandler(success, error);
-	};
+		id newcallback = ^(BOOL success, NSError* error) {
+			NSLog(@"_LSDOpenClient completionHandler(%@) success:%d error:%@", identifier, success, error);
+			if(completionHandler) completionHandler(success, error);
+		};
 
 	%orig(identifier, options, useClientProcessHandle, newcallback);
 }
@@ -170,26 +166,22 @@ static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 
 		if(jbclient_blacklist_check_pid(pid)==true)
 		{
-			if(isJailbreakURLScheme(url.scheme))
-			{
-				NSLog(@"_LSDOpenClient: block openURL:%@", url);
-
-				objc_setAssociatedObject(url, kBlockSchemeTagKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-				blocked = YES;
+				if(isJailbreakURLScheme(url.scheme))
+				{
+					NSLog(@"_LSDOpenClient: block openURL:%@", url);
+					blocked = YES;
+				}
 			}
 		}
-	}
-
-	id newcallback = ^(BOOL success, NSError* error) {
-		NSLog(@"_LSDOpenClient completionHandler(%@) success:%d result:%@", url, success, error);
-		
 		if(blocked) {
-			assert(success == NO);
+			if(completionHandler) completionHandler(NO, nil);
+			return;
 		}
 
-		return completionHandler(success, error);
-	};
+		id newcallback = ^(BOOL success, NSError* error) {
+			NSLog(@"_LSDOpenClient completionHandler(%@) success:%d result:%@", url, success, error);
+			if(completionHandler) completionHandler(success, error);
+		};
 
 	%orig(url, fileHandle, options, newcallback);
 }
@@ -207,26 +199,22 @@ static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 
 		if(jbclient_blacklist_check_pid(pid)==true)
 		{
-			if(isJailbreakURLScheme(url.scheme))
-			{
-				NSLog(@"_LSDOpenClient: block openURL:%@", url);
-
-				objc_setAssociatedObject(url, kBlockSchemeTagKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-				blocked = YES;
+				if(isJailbreakURLScheme(url.scheme))
+				{
+					NSLog(@"_LSDOpenClient: block openURL:%@", url);
+					blocked = YES;
+				}
 			}
 		}
-	}
-
-	id newcallback = ^(BOOL success, NSError* error) {
-		NSLog(@"_LSDOpenClient completionHandler(%@) success:%d result:%@", url, success, error);
-		
 		if(blocked) {
-			assert(success == NO);
+			if(completionHandler) completionHandler(NO, nil);
+			return;
 		}
 
-		return completionHandler(success, error);
-	};
+		id newcallback = ^(BOOL success, NSError* error) {
+			NSLog(@"_LSDOpenClient completionHandler(%@) success:%d result:%@", url, success, error);
+			if(completionHandler) completionHandler(success, error);
+		};
 
 	%orig(url, options, newcallback);
 }
@@ -397,87 +385,123 @@ typedef void (^UTRConformBlock)(intptr_t unitID, const void* unitBytes, intptr_t
 %hook _LSDReadClient
 - (void)getTypeRecordWithTag:(id)tag ofClass:(id)_class conformingToIdentifier:(id)identifier completionHandler:(void(^)(id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getTypeRecordWithTag:%@ ofClass:%@ conforming:%@ pid=%d", tag, _class, identifier, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getTypeRecordWithTag:%@ ofClass:%@ conforming:%@ pid=%d", tag, _class, identifier, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getTypeRecordsWithTag:(id)tag ofClass:(id)_class conformingToIdentifier:(id)identifier completionHandler:(void(^)(id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getTypeRecordsWithTag:%@ ofClass:%@ conforming:%@ pid=%d", tag, _class, identifier, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getTypeRecordsWithTag:%@ ofClass:%@ conforming:%@ pid=%d", tag, _class, identifier, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getTypeRecordWithIdentifier:(id)identifier allowUndeclared:(BOOL)allowUndeclared completionHandler:(void(^)(id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getTypeRecordWithIdentifier:%@ allowUndeclared:%d pid=%d", identifier, allowUndeclared, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getTypeRecordWithIdentifier:%@ allowUndeclared:%d pid=%d", identifier, allowUndeclared, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getTypeRecordsWithIdentifiers:(id)identifiers completionHandler:(void(^)(id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getTypeRecordsWithIdentifiers:%@ pid=%d", identifiers, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getTypeRecordsWithIdentifiers:%@ pid=%d", identifiers, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getTypeRecordForImportedTypeWithIdentifier:(id)identifier conformingToIdentifier:(id)conforming completionHandler:(void(^)(id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getTypeRecordForImportedTypeWithIdentifier:%@ conforming:%@ pid=%d", identifier, conforming, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getTypeRecordForImportedTypeWithIdentifier:%@ conforming:%@ pid=%d", identifier, conforming, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getRelatedTypesOfTypeWithIdentifier:(id)identifier maximumDegreeOfSeparation:(NSInteger)degree completionHandler:(void(^)(id, id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getRelatedTypesOfTypeWithIdentifier:%@ degree:%ld pid=%d", identifier, (long)degree, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getRelatedTypesOfTypeWithIdentifier:%@ degree:%ld pid=%d", identifier, (long)degree, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getWhetherTypeIdentifier:(id)identifier conformsToTypeIdentifier:(id)other completionHandler:(void(^)(id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getWhetherTypeIdentifier:%@ conformsToTypeIdentifier:%@ pid=%d", identifier, other, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getWhetherTypeIdentifier:%@ conformsToTypeIdentifier:%@ pid=%d", identifier, other, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getResourceValuesForKeys:(id)keys URL:(id)url preferredLocalizations:(id)locs completionHandler:(void(^)(id, id, id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getResourceValuesForKeys:%@ URL:%@ pid=%d", keys, url, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getResourceValuesForKeys:%@ URL:%@ pid=%d", keys, url, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
+}
+
+// iOS 26+ replaced the URL argument with an FSMimic object while retaining
+// the same request-scoped filtering contract.
+- (void)getResourceValuesForKeys:(id)keys mimic:(id)mimic preferredLocalizations:(id)locs completionHandler:(void(^)(id, id, id))handler
+{
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getResourceValuesForKeys:%@ mimic:%@ pid=%d", keys, mimic, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 
 - (void)getBoundIconInfoForDocumentProxy:(id)documentProxy completionHandler:(void(^)(id, id))handler
 {
-	if (!utrHideClientBlacklisted(self)) { %orig; return; }
-	NSLog(@"[UTType] getBoundIconInfoForDocumentProxy:%@ pid=%d", documentProxy, utrClientPid(self));
-	g_utrHide = YES;
-	%orig;
-	g_utrHide = NO;
+	BOOL previousHide = g_utrHide;
+	g_utrHide = utrHideClientBlacklisted(self);
+	if (g_utrHide) NSLog(@"[UTType] getBoundIconInfoForDocumentProxy:%@ pid=%d", documentProxy, utrClientPid(self));
+	@try { %orig; } @finally { g_utrHide = previousHide; }
 }
 %end //%hook _LSDReadClient
 
 %end // %group UTTypeHooks
+
+static NSArray *rhArrayByRemovingIndexes(id value, NSIndexSet *indexes, NSUInteger expectedCount)
+{
+	if (![value isKindOfClass:[NSArray class]] || !indexes) return nil;
+	NSArray *array = value;
+	if (array.count != expectedCount) return nil;
+	NSUInteger lastIndex = indexes.lastIndex;
+	if (lastIndex != NSNotFound && lastIndex >= array.count) return nil;
+	NSMutableArray *copy = [array mutableCopy];
+	[copy removeObjectsAtIndexes:indexes];
+	return [copy copy];
+}
+
+static id rhSafeValueForKey(id object, NSString *key)
+{
+	if (!object || !key) return nil;
+	@try {
+		return [object valueForKey:key];
+	} @catch(NSException *exception) {
+		NSLog(@"LaunchServices private KVC read unavailable %@.%@: %@", object, key, exception);
+		return nil;
+	}
+}
+
+static BOOL rhSafeSetValueForKey(id object, NSString *key, id value)
+{
+	if (!object || !key) return NO;
+	@try {
+		[object setValue:value forKey:key];
+		return YES;
+	} @catch(NSException *exception) {
+		NSLog(@"LaunchServices private KVC write unavailable %@.%@: %@", object, key, exception);
+		return NO;
+	}
+}
 
 %hook _LSQueryContext
 
@@ -508,78 +532,91 @@ typedef void (^UTRConformBlock)(intptr_t unitID, const void* unitBytes, intptr_t
 	if(jbclient_blacklist_check_pid(pid)==false) {
 		return result;
 	}
+	if (![result isKindOfClass:[NSDictionary class]]) return result;
+	result = [result mutableCopy];
 
 	NSLog(@"_resolveQueries:%@:%@ XPCConnection:%@ result=%@/%ld proc:%d,%s", [queries class], queries, connection, result.class, result.count, pid, proc_get_path(pid,NULL));
 	//NSLog(@"result=%@, %@", result.allKeys, result.allValues);
-	for(id key in result)
+	for(id key in result.allKeys)
 	{
 		NSLog(@"key type: %@, value type: %@", [key class], [result[key] class]);
 		if([key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithUnits")]
 			|| [key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithIdentifier")]
-			|| [key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithQueryDictionary")])
+				|| [key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithQueryDictionary")])
 		{
-			NSMutableArray* plugins = result[key];
+			id pluginsValue = result[key];
+			if (![pluginsValue isKindOfClass:[NSArray class]]) continue;
+			NSArray* plugins = pluginsValue;
 			NSLog(@"plugins bundle count=%ld", plugins.count);
 
 			NSMutableIndexSet* removed = [[NSMutableIndexSet alloc] init];
-			for (int i=0; i<[plugins count]; i++) 
+				for (NSUInteger i=0; i<[plugins count]; i++)
 			{
 				id plugin = plugins[i]; //LSPlugInKitProxy
+				if (![plugin respondsToSelector:@selector(containingBundle)]) continue;
 				id appbundle = [plugin performSelector:@selector(containingBundle)];
 				// NSLog(@"plugin=%@, %@", plugin, appbundle);
-				if(!appbundle) continue;
+				if(!appbundle || ![appbundle respondsToSelector:@selector(bundleURL)]) continue;
 
 				NSURL* bundleURL = [appbundle performSelector:@selector(bundleURL)];
-				if(isJailbreakBundlePath(bundleURL.path.fileSystemRepresentation)) {
+				if([bundleURL isKindOfClass:[NSURL class]] && isJailbreakBundlePath(bundleURL.path.fileSystemRepresentation)) {
 					NSLog(@"remove plugin %@ (%@)", plugin, bundleURL);
 					[removed addIndex:i];
 				}
 			}
 
-			[plugins removeObjectsAtIndexes:removed];
-			NSLog(@"new plugins bundle count=%ld", plugins.count);
+			NSArray *filteredPlugins = rhArrayByRemovingIndexes(plugins, removed, plugins.count);
+			if (!filteredPlugins) continue;
+			result[key] = filteredPlugins;
+			NSLog(@"new plugins bundle count=%ld", filteredPlugins.count);
 
 			if([key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithUnits")])
 			{
-				//NSLog(@"_pluginUnits=%@", [key valueForKey:@"_pluginUnits"]);
-				NSLog(@"LSPlugInQueryWithUnits: _pluginUnits count=%ld", [[key valueForKey:@"_pluginUnits"] count]);
-
-				NSMutableArray* units = [[key valueForKey:@"_pluginUnits"] mutableCopy];
-				[units removeObjectsAtIndexes:removed];
-				[key setValue:[units copy] forKey:@"_pluginUnits"];
-
-				NSLog(@"LSPlugInQueryWithUnits: new _pluginUnits count=%ld", [[key valueForKey:@"_pluginUnits"] count]);
+				id unitsValue = rhSafeValueForKey(key, @"_pluginUnits");
+				NSArray *filteredUnits = rhArrayByRemovingIndexes(unitsValue, removed, plugins.count);
+				if (!filteredUnits || !rhSafeSetValueForKey(key, @"_pluginUnits", filteredUnits)) {
+					NSLog(@"LSPlugInQueryWithUnits: incompatible _pluginUnits; leaving query metadata unchanged");
+				}
+				else {
+					NSLog(@"LSPlugInQueryWithUnits: new _pluginUnits count=%ld", filteredUnits.count);
+				}
 			}
 			else if([key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithQueryDictionary")])
 			{
-				NSLog(@"LSPlugInQueryWithQueryDictionary: _queryDict=%@", [key valueForKey:@"_queryDict"]);
-				NSLog(@"LSPlugInQueryWithQueryDictionary: _extensionIdentifiers=%@", [key valueForKey:@"_extensionIdentifiers"]);
-				NSLog(@"LSPlugInQueryWithQueryDictionary: _extensionPointIdentifiers=%@", [key valueForKey:@"_extensionPointIdentifiers"]);
+				NSLog(@"LSPlugInQueryWithQueryDictionary: _queryDict=%@", rhSafeValueForKey(key, @"_queryDict"));
+				NSLog(@"LSPlugInQueryWithQueryDictionary: _extensionIdentifiers=%@", rhSafeValueForKey(key, @"_extensionIdentifiers"));
+				NSLog(@"LSPlugInQueryWithQueryDictionary: _extensionPointIdentifiers=%@", rhSafeValueForKey(key, @"_extensionPointIdentifiers"));
 			}
 			else if([key isKindOfClass:NSClassFromString(@"LSPlugInQueryWithIdentifier")])
 			{
-				NSLog(@"LSPlugInQueryWithIdentifier: _identifier=%@", [key valueForKey:@"_identifier"]);
+				NSLog(@"LSPlugInQueryWithIdentifier: _identifier=%@", rhSafeValueForKey(key, @"_identifier"));
 			}
 		}
 		else if([key isKindOfClass:NSClassFromString(@"LSPlugInQueryAllUnits")])
 		{
-			NSMutableArray* unitsArray = result[key];
-			for (int i=0; i<[unitsArray count]; i++)
+			id unitsValue = result[key];
+			if (![unitsValue isKindOfClass:[NSArray class]]) continue;
+			NSArray* unitsArray = unitsValue;
+			for (NSUInteger i=0; i<[unitsArray count]; i++)
 			{
 				id unitsResult = unitsArray[i]; //LSPlugInQueryAllUnitsResult
 
-				NSUUID* _dbUUID = [unitsResult valueForKey:@"_dbUUID"];
-				NSArray* _pluginUnits = [unitsResult valueForKey:@"_pluginUnits"];
+				NSUUID* _dbUUID = rhSafeValueForKey(unitsResult, @"_dbUUID");
+				NSArray* _pluginUnits = rhSafeValueForKey(unitsResult, @"_pluginUnits");
+				if (![_dbUUID isKindOfClass:[NSUUID class]] || ![_pluginUnits isKindOfClass:[NSArray class]]) continue;
 				NSLog(@"LSPlugInQueryAllUnits: _dbUUID=%@, _pluginUnits count=%ld", _dbUUID, _pluginUnits.count);
-				id unitQuery = [[NSClassFromString(@"LSPlugInQueryWithUnits") alloc] initWithPlugInUnits:_pluginUnits forDatabaseWithUUID:_dbUUID];
+				Class unitsQueryClass = NSClassFromString(@"LSPlugInQueryWithUnits");
+				id unitQuery = [unitsQueryClass instancesRespondToSelector:@selector(initWithPlugInUnits:forDatabaseWithUUID:)] ? [[unitsQueryClass alloc] initWithPlugInUnits:_pluginUnits forDatabaseWithUUID:_dbUUID] : nil;
+				if (!unitQuery) continue;
 				NSMutableDictionary* queriesResult = [self _resolveQueries:[NSSet setWithObject:unitQuery].mutableCopy XPCConnection:connection error:perror];
 				if(queriesResult)
 				{
 					for(id queryKey in queriesResult)
 					{
-						NSArray* new_pluginUnits = [queryKey valueForKey:@"_pluginUnits"];
-						[unitsResult setValue:new_pluginUnits forKey:@"_pluginUnits"];
-						NSLog(@"LSPlugInQueryAllUnits: new _pluginUnits count=%ld", new_pluginUnits.count);
+						NSArray* new_pluginUnits = rhSafeValueForKey(queryKey, @"_pluginUnits");
+						if ([new_pluginUnits isKindOfClass:[NSArray class]] && rhSafeSetValueForKey(unitsResult, @"_pluginUnits", new_pluginUnits)) {
+							NSLog(@"LSPlugInQueryAllUnits: new _pluginUnits count=%ld", new_pluginUnits.count);
+						}
 					}
 				}
 			}

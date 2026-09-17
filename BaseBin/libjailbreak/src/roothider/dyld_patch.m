@@ -97,9 +97,49 @@ void patchedtest(mach_port_t task, uint64_t remoteLoadAddress)
 }
 
 #define DYLD_INFO_MAX_SEARCH_INDEX 200
-int task_set_dyld_info(uint64_t task, uint64_t addr, uint64_t size)
+#define DYLD_INFO_INVALID_OFFSET UINT32_MAX
+struct task_dyld_info_snapshot {
+    uint64_t pairAddress;
+    uint64_t pair[2];
+    bool hasAuxiliary;
+    uint64_t auxiliaryAddress;
+    uint64_t auxiliary[6];
+};
+
+static int restore_task_dyld_info_snapshot(const struct task_dyld_info_snapshot *snapshot)
 {
-    static uint32_t all_image_info_addr_offset=0, all_image_info_size_offset=0, info_offset=0;
+    if (!snapshot || !snapshot->pairAddress) return -1;
+
+    int result = 0;
+    if (kwritebuf(snapshot->pairAddress, snapshot->pair, sizeof(snapshot->pair)) != 0) {
+        result = -1;
+    }
+    uint64_t verifyPair[2] = {0};
+    if (kreadbuf(snapshot->pairAddress, verifyPair, sizeof(verifyPair)) != 0 ||
+        memcmp(verifyPair, snapshot->pair, sizeof(verifyPair)) != 0) {
+        result = -1;
+    }
+
+    if (snapshot->hasAuxiliary) {
+        if (kwritebuf(snapshot->auxiliaryAddress, snapshot->auxiliary, sizeof(snapshot->auxiliary)) != 0) {
+            result = -1;
+        }
+        uint64_t verifyAuxiliary[6] = {0};
+        if (kreadbuf(snapshot->auxiliaryAddress, verifyAuxiliary, sizeof(verifyAuxiliary)) != 0 ||
+            memcmp(verifyAuxiliary, snapshot->auxiliary, sizeof(verifyAuxiliary)) != 0) {
+            result = -1;
+        }
+    }
+    return result;
+}
+
+static int task_set_dyld_info_internal(uint64_t task, mach_port_t taskPort, uint64_t addr, uint64_t size,
+                                       struct task_dyld_info_snapshot *snapshotOut)
+{
+    static uint32_t all_image_info_addr_offset = DYLD_INFO_INVALID_OFFSET;
+    static uint32_t all_image_info_size_offset = DYLD_INFO_INVALID_OFFSET;
+    static uint32_t info_offset = DYLD_INFO_INVALID_OFFSET;
+    static bool layoutReady = false;
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -116,50 +156,126 @@ int task_set_dyld_info(uint64_t task, uint64_t addr, uint64_t size)
         uint64_t selftask = task_self();
         JBLogDebug("task_set_dyld_info: selftask=%llx", selftask);
 
-        int i=0;
-        for(; i<DYLD_INFO_MAX_SEARCH_INDEX; i++) 
-        {
-            if(kread64(selftask + i*8)==dyldInfo.all_image_info_addr
-             && kread64(selftask + (i+1)*8)==dyldInfo.all_image_info_size) {
-                JBLogDebug("task_set_dyld_info: all_image_info_addr offset=[%d]0x%x", i, i*8 );
-                JBLogDebug("task_set_dyld_info: all_image_info_size offset=[%d]0x%x", i+1, (i+1)*8 );
-                
-                all_image_info_addr_offset = i*8;
-                all_image_info_size_offset = (i+1)*8;
+        uint32_t candidateCount = 0;
+        for (uint32_t i = 0; i + 1 < DYLD_INFO_MAX_SEARCH_INDEX; i++) {
+            uint64_t pair[2] = {0};
+            if (kreadbuf(selftask + i * sizeof(uint64_t), pair, sizeof(pair)) != 0) {
+                JBLogError("task_set_dyld_info: failed reading self task while locating dyld fields");
+                return;
+            }
+            if (pair[0] == dyldInfo.all_image_info_addr && pair[1] == dyldInfo.all_image_info_size) {
+                candidateCount++;
+                all_image_info_addr_offset = i * sizeof(uint64_t);
+                all_image_info_size_offset = (i + 1) * sizeof(uint64_t);
+            }
+        }
 
-                break;
+        if (candidateCount != 1) {
+            JBLogError("task_set_dyld_info: expected one dyld-info field pair, found %u", candidateCount);
+            all_image_info_addr_offset = DYLD_INFO_INVALID_OFFSET;
+            all_image_info_size_offset = DYLD_INFO_INVALID_OFFSET;
+            return;
+        }
+
+        const uint64_t expectedInfo[6] = {1,0,0,0,1,0};
+        candidateCount = 0;
+        for (uint32_t i = 0; i + 6 <= DYLD_INFO_MAX_SEARCH_INDEX; i++) {
+            uint64_t buffer[6] = {0};
+            if (kreadbuf(selftask + i * sizeof(uint64_t), buffer, sizeof(buffer)) != 0) {
+                JBLogError("task_set_dyld_info: failed reading self task while locating auxiliary dyld fields");
+                return;
+            }
+            if (memcmp(buffer, expectedInfo, sizeof(expectedInfo)) == 0) {
+                candidateCount++;
+                info_offset = i * sizeof(uint64_t);
             }
         }
-        for(; i<(DYLD_INFO_MAX_SEARCH_INDEX+0); i++) {
-            uint64_t info[6] = {1,0,0,0,1,0};
-            uint8_t buffer[sizeof(info)] = {0};
-            kreadbuf(task + i*8, buffer, sizeof(buffer));
-            if(memcmp(buffer, info, sizeof(info))==0) {
-                JBLogDebug("task_set_dyld_info: info offset=[%d]0x%x\n", i, i*8);
-                info_offset = i*8;
-                break;
-            }
+
+        if (candidateCount != 1) {
+            JBLogError("task_set_dyld_info: auxiliary layout is not unique (%u candidates)", candidateCount);
+            info_offset = DYLD_INFO_INVALID_OFFSET;
         }
+
+        JBLogDebug("task_set_dyld_info: dyld offsets=%x/%x auxiliary=%x",
+                   all_image_info_addr_offset, all_image_info_size_offset, info_offset);
+        layoutReady = true;
     });
 
-    if(all_image_info_addr_offset==0 || all_image_info_size_offset==0) {
+    if (!layoutReady || all_image_info_addr_offset == DYLD_INFO_INVALID_OFFSET ||
+        all_image_info_size_offset == DYLD_INFO_INVALID_OFFSET || !MACH_PORT_VALID(taskPort)) {
         JBLogError("invalid all_image_info_addr/size offset");
-        abort();
         return -1;
     }
 
-    if(info_offset) {
-        uint64_t info[6] = {0};
-        kwritebuf(task + info_offset, info, sizeof(info));
-    } else if(task != proc_task(proc_find(1))) {
-        JBLogError("invalid info offset");
-        abort();
+    task_dyld_info_data_t currentInfo = {0};
+    uint32_t currentInfoCount = TASK_DYLD_INFO_COUNT;
+    kern_return_t kr = task_info(taskPort, TASK_DYLD_INFO, (task_info_t)&currentInfo, &currentInfoCount);
+    if (kr != KERN_SUCCESS) {
+        JBLogError("task_set_dyld_info: target task_info failed: %d,%s", kr, mach_error_string(kr));
         return -1;
     }
 
-    kwrite64(task + all_image_info_addr_offset, addr);
-    kwrite64(task + all_image_info_size_offset, size);
+    struct task_dyld_info_snapshot snapshot = {
+        .pairAddress = task + all_image_info_addr_offset,
+    };
+    if (kreadbuf(snapshot.pairAddress, snapshot.pair, sizeof(snapshot.pair)) != 0 ||
+        snapshot.pair[0] != currentInfo.all_image_info_addr || snapshot.pair[1] != currentInfo.all_image_info_size) {
+        JBLogError("task_set_dyld_info: target dyld fields do not match TASK_DYLD_INFO");
+        return -1;
+    }
+
+    uint64_t launchdTask = 0;
+    uint64_t launchdProc = proc_find(1);
+    if (launchdProc) launchdTask = proc_task(launchdProc);
+
+    const uint64_t expectedInfo[6] = {1,0,0,0,1,0};
+    uint64_t oldAuxInfo[6] = {0};
+    bool clearAuxInfo = false;
+    if (info_offset != DYLD_INFO_INVALID_OFFSET) {
+        snapshot.auxiliaryAddress = task + info_offset;
+        if (kreadbuf(snapshot.auxiliaryAddress, oldAuxInfo, sizeof(oldAuxInfo)) != 0) {
+            JBLogError("task_set_dyld_info: failed reading target auxiliary fields");
+            return -1;
+        }
+        clearAuxInfo = memcmp(oldAuxInfo, expectedInfo, sizeof(expectedInfo)) == 0;
+        if (clearAuxInfo) {
+            snapshot.hasAuxiliary = true;
+            memcpy(snapshot.auxiliary, oldAuxInfo, sizeof(oldAuxInfo));
+        }
+    }
+    if (!clearAuxInfo && (!launchdTask || task != launchdTask)) {
+        JBLogError("task_set_dyld_info: target auxiliary layout does not match validated task layout");
+        return -1;
+    }
+
+    if (clearAuxInfo) {
+        uint64_t zeroInfo[6] = {0};
+        if (kwritebuf(snapshot.auxiliaryAddress, zeroInfo, sizeof(zeroInfo)) != 0) {
+            JBLogError("task_set_dyld_info: failed clearing target auxiliary dyld fields");
+            return restore_task_dyld_info_snapshot(&snapshot) == 0 ? -1 : -2;
+        }
+    }
+
+    uint64_t newPair[2] = {addr, size};
+    if (kwritebuf(snapshot.pairAddress, newPair, sizeof(newPair)) != 0) {
+        JBLogError("task_set_dyld_info: failed publishing target dyld fields");
+        return restore_task_dyld_info_snapshot(&snapshot) == 0 ? -1 : -2;
+    }
+
+    uint64_t verifyPair[2] = {0};
+    if (kreadbuf(snapshot.pairAddress, verifyPair, sizeof(verifyPair)) != 0 ||
+        memcmp(verifyPair, newPair, sizeof(newPair)) != 0) {
+        JBLogError("task_set_dyld_info: target dyld publication did not verify");
+        return restore_task_dyld_info_snapshot(&snapshot) == 0 ? -1 : -2;
+    }
+
+    if (snapshotOut) *snapshotOut = snapshot;
     return 0;
+}
+
+int task_set_dyld_info(uint64_t task, mach_port_t taskPort, uint64_t addr, uint64_t size)
+{
+    return task_set_dyld_info_internal(task, taskPort, addr, size, NULL);
 }
 
 void analyzeSegmentsLayout(struct mach_header_64* header, uint64_t* vmSpace, bool* hasZeroFill)
@@ -246,13 +362,28 @@ int loadSinature(int fd, struct mach_header_64* header)
 static uint64_t get_symbol(const char* path, const char* name)
 {
     void *csHandle = dlopen("/System/Library/PrivateFrameworks/CoreSymbolication.framework/CoreSymbolication", RTLD_NOW);
+	if (!csHandle) return 0;
 	CSSymbolicatorRef (*__CSSymbolicatorCreateWithPathAndArchitecture)(const char* path, cpu_type_t type) = dlsym(csHandle, "CSSymbolicatorCreateWithPathAndArchitecture");
 	CSSymbolRef (*__CSSymbolicatorGetSymbolWithMangledNameAtTime)(CSSymbolicatorRef cs, const char* name, uint64_t time) = dlsym(csHandle, "CSSymbolicatorGetSymbolWithMangledNameAtTime");
 	CSRange (*__CSSymbolGetRange)(CSSymbolRef sym) = dlsym(csHandle, "CSSymbolGetRange");
+	if (!__CSSymbolicatorCreateWithPathAndArchitecture ||
+		!__CSSymbolicatorGetSymbolWithMangledNameAtTime || !__CSSymbolGetRange) {
+		dlclose(csHandle);
+		return 0;
+	}
 
 	CSSymbolicatorRef symbolicator = __CSSymbolicatorCreateWithPathAndArchitecture(path, CPU_TYPE_ARM64);
+	if (!symbolicator.csCppObj) {
+		dlclose(csHandle);
+		return 0;
+	}
 	CSSymbolRef symbol = __CSSymbolicatorGetSymbolWithMangledNameAtTime(symbolicator, name, 0);
+	if (!symbol.csCppObj) {
+		dlclose(csHandle);
+		return 0;
+	}
 	CSRange range = __CSSymbolGetRange(symbol);
+	dlclose(csHandle);
     return range.location;
 }
 
@@ -279,10 +410,6 @@ struct DYLDINFO* loadDyldInfo(const char* path)
 
     result->loadDyldCache_function = get_symbol(path, "__ZN5dyld313loadDyldCacheERKNS_18SharedCacheOptionsEPNS_19SharedCacheLoadInfoE");
     JBLogDebug("loadDyldCache function: %llx", result->loadDyldCache_function);
-    if(result->loadDyldCache_function == 0) {
-        JBLogError("loadDyldInfo: loadDyldCache_function not found in %s", path);
-        goto failed;
-    }
 
     result->loadDyldCache_trampoline = get_symbol(path, "_ORIG__ZN5dyld313loadDyldCacheERKNS_18SharedCacheOptionsEPNS_19SharedCacheLoadInfoE");
     JBLogDebug("loadDyldCache orig trampoline: %llx", result->loadDyldCache_trampoline);
@@ -452,7 +579,27 @@ final:
 int hook_dyld_entry(mach_port_t task, uint64_t old_header, uint64_t old_entry, uint64_t new_entry)
 {
     //Destroy the old dyld header first to avoid double dyld being found via vm_region*
-    
+    struct mach_header_64 originalHeader = {0};
+    uint32_t originalEntry[5] = {0};
+    vm_size_t readSize = 0;
+    if (vm_read_overwrite(task, (vm_address_t)old_header, sizeof(originalHeader),
+                          (vm_address_t)&originalHeader, &readSize) != KERN_SUCCESS ||
+        readSize != sizeof(originalHeader)) {
+        JBLogError("vm_read original header failed");
+        return -1;
+    }
+    readSize = 0;
+    if (vm_read_overwrite(task, (vm_address_t)old_entry, sizeof(originalEntry),
+                          (vm_address_t)originalEntry, &readSize) != KERN_SUCCESS ||
+        readSize != sizeof(originalEntry)) {
+        JBLogError("vm_read original entry failed");
+        return -1;
+    }
+
+    bool headerWritable = false;
+    bool headerChanged = false;
+    bool entryWritable = false;
+    bool entryChanged = false;
     struct mach_header_64 padding = {0};
 
     kern_return_t kr = vm_protect(task, (vm_address_t)old_header, sizeof(padding), false, VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY);
@@ -460,12 +607,14 @@ int hook_dyld_entry(mach_port_t task, uint64_t old_header, uint64_t old_entry, u
         JBLogError("vm_protect header failed: %d,%s", kr, mach_error_string(kr));
         return -1;
     }
+    headerWritable = true;
 
     kr = vm_write(task, (vm_address_t)old_header, (vm_offset_t)&padding, sizeof(padding));
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_write header failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    headerChanged = true;
 
 
     uint32_t codes[] = {
@@ -491,22 +640,64 @@ br   x0
     kr = vm_protect(task, (vm_address_t)old_entry, sizeof(codes), false, VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_protect rw(cpoy) failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    entryWritable = true;
 
     kr = vm_write(task, (vm_address_t)old_entry, (vm_offset_t)codes, sizeof(codes));
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_write failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    entryChanged = true;
 
-    kr = vm_protect(task, (vm_address_t)old_entry, sizeof(void*), false, VM_PROT_READ|VM_PROT_EXECUTE);
+    kr = vm_protect(task, (vm_address_t)old_entry, sizeof(codes), false, VM_PROT_READ|VM_PROT_EXECUTE);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_protect rx failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    entryWritable = false;
+
+    kr = vm_protect(task, (vm_address_t)old_header, sizeof(padding), false, VM_PROT_READ|VM_PROT_EXECUTE);
+    if(kr != KERN_SUCCESS) {
+        JBLogError("vm_protect header rx failed: %d,%s", kr, mach_error_string(kr));
+        goto failed;
+    }
+    headerWritable = false;
 
     return 0;
+
+failed:
+{
+    bool rollbackFailed = false;
+    if (entryChanged || entryWritable) {
+        if (vm_protect(task, (vm_address_t)old_entry, sizeof(originalEntry), false,
+                       VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY) == KERN_SUCCESS) {
+            if (entryChanged) {
+                if (vm_write(task, (vm_address_t)old_entry, (vm_offset_t)originalEntry, sizeof(originalEntry)) != KERN_SUCCESS) {
+                    rollbackFailed = true;
+                }
+            }
+            if (vm_protect(task, (vm_address_t)old_entry, sizeof(originalEntry), false,
+                           VM_PROT_READ|VM_PROT_EXECUTE) != KERN_SUCCESS) rollbackFailed = true;
+        }
+        else rollbackFailed = true;
+    }
+    if (headerChanged || headerWritable) {
+        if (vm_protect(task, (vm_address_t)old_header, sizeof(originalHeader), false,
+                       VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY) == KERN_SUCCESS) {
+            if (headerChanged) {
+                if (vm_write(task, (vm_address_t)old_header, (vm_offset_t)&originalHeader, sizeof(originalHeader)) != KERN_SUCCESS) {
+                    rollbackFailed = true;
+                }
+            }
+            if (vm_protect(task, (vm_address_t)old_header, sizeof(originalHeader), false,
+                           VM_PROT_READ|VM_PROT_EXECUTE) != KERN_SUCCESS) rollbackFailed = true;
+        }
+        else rollbackFailed = true;
+    }
+    return rollbackFailed ? -2 : -1;
+}
 }
 
 int hook_dyld_function(mach_port_t task, uint64_t old_func, uint64_t new_func, uint64_t orig_func)
@@ -532,29 +723,54 @@ br   x17
     tramp[2] |= (((old_func+sizeof(tramp)) >> 16) & 0xffff) << 5;
     tramp[3] |= (((old_func+sizeof(tramp)) >>  0) & 0xffff) << 5;
 
+    uint8_t originalFunction[sizeof(tramp)] = {0};
+    uint8_t originalTrampoline[sizeof(tramp) * 2] = {0};
+    vm_size_t readSize = 0;
+    if (vm_read_overwrite(task, (vm_address_t)old_func, sizeof(originalFunction),
+                          (vm_address_t)originalFunction, &readSize) != KERN_SUCCESS ||
+        readSize != sizeof(originalFunction)) {
+        JBLogError("vm_read original dyld function failed");
+        return -1;
+    }
+    readSize = 0;
+    if (vm_read_overwrite(task, (vm_address_t)orig_func, sizeof(originalTrampoline),
+                          (vm_address_t)originalTrampoline, &readSize) != KERN_SUCCESS ||
+        readSize != sizeof(originalTrampoline)) {
+        JBLogError("vm_read original dyld trampoline failed");
+        return -1;
+    }
+
+    bool trampolineWritable = false;
+    bool trampolineChanged = false;
+    bool functionWritable = false;
+    bool functionChanged = false;
+
     kern_return_t kr = vm_protect(task, (vm_address_t)orig_func, sizeof(tramp)*2, false, VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_protect rw(cpoy) failed: %d,%s", kr, mach_error_string(kr));
         return -1;
     }
+    trampolineWritable = true;
 
     kr = vm_copy(task, (vm_address_t)old_func, sizeof(tramp), (vm_address_t)orig_func);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_copy failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    trampolineChanged = true;
 
     kr = vm_write(task, (vm_address_t)(orig_func+sizeof(tramp)), (vm_offset_t)tramp, sizeof(tramp));
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_write failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
 
     kr = vm_protect(task, (vm_address_t)orig_func, sizeof(tramp)*2, false, VM_PROT_READ|VM_PROT_EXECUTE);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_protect rx failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    trampolineWritable = false;
 
 
 
@@ -568,22 +784,57 @@ br   x17
     kr = vm_protect(task, (vm_address_t)old_func, sizeof(codes), false, VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_protect rw(cpoy) failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    functionWritable = true;
 
     kr = vm_write(task, (vm_address_t)old_func, (vm_offset_t)codes, sizeof(codes));
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_write failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    functionChanged = true;
 
-    kr = vm_protect(task, (vm_address_t)old_func, sizeof(void*), false, VM_PROT_READ|VM_PROT_EXECUTE);
+    kr = vm_protect(task, (vm_address_t)old_func, sizeof(codes), false, VM_PROT_READ|VM_PROT_EXECUTE);
     if(kr != KERN_SUCCESS) {
         JBLogError("vm_protect rx failed: %d,%s", kr, mach_error_string(kr));
-        return -1;
+        goto failed;
     }
+    functionWritable = false;
 
     return 0;
+
+failed:
+{
+    bool rollbackFailed = false;
+    if (functionChanged || functionWritable) {
+        if (vm_protect(task, (vm_address_t)old_func, sizeof(originalFunction), false,
+                       VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY) == KERN_SUCCESS) {
+            if (functionChanged) {
+                if (vm_write(task, (vm_address_t)old_func, (vm_offset_t)originalFunction, sizeof(originalFunction)) != KERN_SUCCESS) {
+                    rollbackFailed = true;
+                }
+            }
+            if (vm_protect(task, (vm_address_t)old_func, sizeof(originalFunction), false,
+                           VM_PROT_READ|VM_PROT_EXECUTE) != KERN_SUCCESS) rollbackFailed = true;
+        }
+        else rollbackFailed = true;
+    }
+    if (trampolineChanged || trampolineWritable) {
+        if (vm_protect(task, (vm_address_t)orig_func, sizeof(originalTrampoline), false,
+                       VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY) == KERN_SUCCESS) {
+            if (trampolineChanged) {
+                if (vm_write(task, (vm_address_t)orig_func, (vm_offset_t)originalTrampoline, sizeof(originalTrampoline)) != KERN_SUCCESS) {
+                    rollbackFailed = true;
+                }
+            }
+            if (vm_protect(task, (vm_address_t)orig_func, sizeof(originalTrampoline), false,
+                           VM_PROT_READ|VM_PROT_EXECUTE) != KERN_SUCCESS) rollbackFailed = true;
+        }
+        else rollbackFailed = true;
+    }
+    return rollbackFailed ? -2 : -1;
+}
 }
 
 int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
@@ -594,14 +845,15 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
     const char *phase = "dyld metadata";
     task_port_t task = MACH_PORT_NULL;
     vm_address_t  remoteLoadAddress = 0;
+    bool keepRemoteMapping = false;
 
     static struct DYLDINFO* stockDyldInfo = NULL;
     static struct DYLDINFO* patchedDyldInfo = NULL;
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        assert((stockDyldInfo=loadDyldInfo("/usr/lib/dyld")) != NULL);
-        assert((patchedDyldInfo=loadDyldInfo(JBROOT_PATH("/basebin/.fakelib/dyld"))) != NULL);
+        stockDyldInfo = loadDyldInfo("/usr/lib/dyld");
+        patchedDyldInfo = loadDyldInfo(JBROOT_PATH("/basebin/.fakelib/dyld"));
     });
 
     if(stockDyldInfo == NULL || patchedDyldInfo == NULL) {
@@ -662,8 +914,15 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
             iOS15Arm64e = true;
         }
 #endif
-        assert(iOS15Arm64e == true);
-        assert(dyld_patch_enabled());
+        if (!iOS15Arm64e || !dyld_patch_enabled()) {
+            JBLogError("spinlock-only dyld patch requested outside the supported iOS 15 arm64e mode");
+            goto failed;
+        }
+		if (stockDyldInfo->loadDyldCache_function == 0 || patchedDyldInfo->loadDyldCache_function == 0 ||
+			patchedDyldInfo->loadDyldCache_trampoline == 0) {
+			JBLogError("loadDyldCache symbols unavailable for iOS 15 arm64e spinlock fix");
+			goto failed;
+		}
 
         uint64_t loadDyldCache_old = dyld_address + stockDyldInfo->loadDyldCache_function;
         uint64_t loadDyldCache_new = remoteLoadAddress + patchedDyldInfo->loadDyldCache_function;
@@ -671,12 +930,15 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 
         cs_allow_invalid(bsd_proc, false);
 
-        if(hook_dyld_function(task, loadDyldCache_old, loadDyldCache_new, loadDyldCache_orig) != 0) {
+        int hookResult = hook_dyld_function(task, loadDyldCache_old, loadDyldCache_new, loadDyldCache_orig);
+        if(hookResult != 0) {
+            if (hookResult == -2) keepRemoteMapping = true;
             JBLogError("hook dyld loadDyldCache failed");
             goto failed;
         }
+        keepRemoteMapping = true;
 
-        if(task_set_dyld_info(mach_task, dyld_address + stockDyldInfo->all_image_info_addr, stockDyldInfo->all_image_info_size) != 0) {
+        if(task_set_dyld_info(mach_task, task, dyld_address + stockDyldInfo->all_image_info_addr, stockDyldInfo->all_image_info_size) != 0) {
             JBLogError("task_set_dyld_info failed");
             goto failed;
         }
@@ -694,6 +956,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
     void* new_entry = (void*)(remoteLoadAddress + patchedDyldInfo->entrypoint);
 
     bool reentry = false;
+    struct task_dyld_info_snapshot dyldInfoSnapshot = {0};
     
     thread_act_array_t allThreads=NULL;
     mach_msg_type_number_t threadCount = 0;
@@ -718,7 +981,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
         kr = thread_get_state(allThreads[i], ARM_THREAD_STATE64, (thread_state_t)&threadState, &threadStateCount);
         if(kr != KERN_SUCCESS) {
             JBLogError("thread_get_state %d,%s", kr, mach_error_string(kr));
-            goto failed;
+            goto reentry_end;
         }
 
         arm_thread_state64_t strippedState = threadState; /* some process such as WebContent used a different pac key
@@ -736,6 +999,16 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
         {
             JBLogDebug("dyld entrypoint found in thread[%d]:%x", i, allThreads[i]);
 
+            phase = "dyld info publication";
+            int dyldInfoResult = task_set_dyld_info_internal(mach_task, task,
+                remoteLoadAddress + patchedDyldInfo->all_image_info_addr,
+                patchedDyldInfo->all_image_info_size, &dyldInfoSnapshot);
+            if (dyldInfoResult != 0) {
+                if (dyldInfoResult == -2) keepRemoteMapping = true;
+                JBLogError("task_set_dyld_info failed");
+                goto reentry_end;
+            }
+
 #ifdef __arm64e__
             void* savedPC = threadState.__opaque_pc;
             void* resignedPC = ptrauth_sign_unauthenticated((void*)strippedPC, ptrauth_key_process_independent_code, 0);
@@ -746,7 +1019,11 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
                 cs_allow_invalid(bsd_proc, false);
 
                 phase = "entrypoint trampoline";
-                if(hook_dyld_entry(task, dyld_address, dyld_entry, (uint64_t)new_entry) != 0) {
+                int hookResult = hook_dyld_entry(task, dyld_address, dyld_entry, (uint64_t)new_entry);
+                if(hookResult != 0) {
+                    if (hookResult == -2 || restore_task_dyld_info_snapshot(&dyldInfoSnapshot) != 0) {
+                        keepRemoteMapping = true;
+                    }
                     JBLogError("hook_dyld_entry failed");
                     goto reentry_end;
                 }
@@ -759,10 +1036,12 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 #ifdef __arm64e__
             new_entry = ptrauth_sign_unauthenticated(new_entry, ptrauth_key_process_independent_code, 0);
 #endif
+            arm_thread_state64_t originalThreadState = threadState;
             __darwin_arm_thread_state64_set_pc_fptr(threadState, new_entry);
             phase = "thread_set_state";
             kr = thread_set_state(allThreads[i], ARM_THREAD_STATE64, (thread_state_t)&threadState, threadStateCount);
             if(kr != KERN_SUCCESS) {
+                if (restore_task_dyld_info_snapshot(&dyldInfoSnapshot) != 0) keepRemoteMapping = true;
                 JBLogError("thread_set_state failed: %d,%s", kr, mach_error_string(kr));
                 goto reentry_end;
             }
@@ -770,6 +1049,10 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
             phase = "old mapping release";
             kr = vm_deallocate(task, dyld_address, stockDyldInfo->vmSpaceSize);
             if(kr != KERN_SUCCESS) {
+                kern_return_t restoreStateResult = thread_set_state(allThreads[i], ARM_THREAD_STATE64,
+                    (thread_state_t)&originalThreadState, threadStateCount);
+                int restoreInfoResult = restore_task_dyld_info_snapshot(&dyldInfoSnapshot);
+                if (restoreStateResult != KERN_SUCCESS || restoreInfoResult != 0) keepRemoteMapping = true;
                 JBLogError("vm_deallocate old dyld failed: %d,%s", kr, mach_error_string(kr));
                 goto reentry_end;
             }
@@ -790,12 +1073,6 @@ reentry_end:
         goto failed;
     }
 
-    phase = "dyld info publication";
-    if(task_set_dyld_info(mach_task, remoteLoadAddress + patchedDyldInfo->all_image_info_addr, patchedDyldInfo->all_image_info_size) != 0) {
-        JBLogError("task_set_dyld_info failed");
-        goto failed;
-    }
-
     JBLogDebug("dyld all_image_info update: %p -> %p", (void*)(dyld_address + stockDyldInfo->all_image_info_addr), (void*)(remoteLoadAddress + patchedDyldInfo->all_image_info_addr));
 
 
@@ -811,7 +1088,7 @@ failed:
         roothide_bootlog(message);
     }
     ret = -1;
-    if(remoteLoadAddress) {
+    if(remoteLoadAddress && !keepRemoteMapping) {
         vm_deallocate(task, remoteLoadAddress, patchedDyldInfo->vmSpaceSize);
     }
 

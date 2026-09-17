@@ -201,6 +201,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 	gSystemInfo.kernelStruct.ucred.uid    = ucred_cr_posix +  0x0;
 	gSystemInfo.kernelStruct.ucred.ruid   = ucred_cr_posix +  0x4;
 	gSystemInfo.kernelStruct.ucred.svuid  = ucred_cr_posix +  0x8;
+	gSystemInfo.kernelStruct.ucred.ngroups = ucred_cr_posix + 0xC;
 	gSystemInfo.kernelStruct.ucred.groups = ucred_cr_posix + 0x10;
 	gSystemInfo.kernelStruct.ucred.rgid   = ucred_cr_posix + 0x50;
 	gSystemInfo.kernelStruct.ucred.svgid  = ucred_cr_posix + 0x54;

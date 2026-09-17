@@ -60,6 +60,7 @@ bool jbclient_roothide_jailbroken()
 
     xpc_object_t xargs = xpc_dictionary_create_empty();
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_JAILBROKEN_CHECK, xargs);
+	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
 		if(result == 0) {
@@ -77,6 +78,7 @@ bool jbclient_palehide_present()
 
     xpc_object_t xargs = xpc_dictionary_create_empty();
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_PALEHIDE_PRESENT, xargs);
+	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
 		if(result == 0) {
@@ -96,6 +98,7 @@ bool jbclient_blacklist_check_pid(pid_t pid)
     xpc_dictionary_set_string(xargs, "checktype", "pid");
     xpc_dictionary_set_uint64(xargs, "checkvalue", pid);
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_BLACKLIST_CHECK, xargs);
+	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
 		if(result == 0) {
@@ -115,6 +118,7 @@ bool jbclient_blacklist_check_path(const char* path)
     xpc_dictionary_set_string(xargs, "checktype", "path");
     xpc_dictionary_set_string(xargs, "checkvalue", path);
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_BLACKLIST_CHECK, xargs);
+	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
 		if(result == 0) {
@@ -134,6 +138,7 @@ bool jbclient_blacklist_check_bundle(const char* bundle)
     xpc_dictionary_set_string(xargs, "checktype", "bundle");
     xpc_dictionary_set_string(xargs, "checkvalue", bundle);
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_BLACKLIST_CHECK, xargs);
+	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
 		if(result == 0) {
@@ -178,6 +183,27 @@ int jbclient_trust_executable_recurse(const char *executablePath, xpc_object_t p
 
 extern const char* dyld_image_path_containing_address(const void* addr);
 
+static xpc_object_t jbclient_copy_execution_arch_preferences(void *addressInCaller)
+{
+	const struct mach_header *header = NULL;
+	if (addressInCaller) {
+		Dl_info info = {0};
+		if (dladdr(addressInCaller, &info) != 0 && info.dli_fbase) {
+			header = (const struct mach_header *)info.dli_fbase;
+		}
+	}
+	if (!header) header = _dyld_get_image_header(0);
+	if (!header || header->magic != MH_MAGIC_64) return NULL;
+
+	xpc_object_t arch = xpc_dictionary_create_empty();
+	xpc_dictionary_set_uint64(arch, "type", (uint32_t)header->cputype);
+	xpc_dictionary_set_uint64(arch, "subtype", (uint32_t)header->cpusubtype);
+	xpc_object_t arches = xpc_array_create_empty();
+	xpc_array_append_value(arches, arch);
+	xpc_release(arch);
+	return arches;
+}
+
 int jbclient_trust_library_recurse(const char *libraryPath, void *addressInCaller)
 {
 	if (!libraryPath) return -1;
@@ -218,6 +244,12 @@ int jbclient_trust_library_recurse(const char *libraryPath, void *addressInCalle
 		free((void*)cwd);
 	}
 
+	xpc_object_t preferredArchs = jbclient_copy_execution_arch_preferences(addressInCaller);
+	if (preferredArchs) {
+		xpc_dictionary_set_value(xargs, "preferred-archs", preferredArchs);
+		xpc_release(preferredArchs);
+	}
+
 
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_TRUST_LIBRARY_RECURSE, xargs);
 	xpc_release(xargs);
@@ -237,6 +269,7 @@ bool jbclient_dyld_patch_enabled()
 	dispatch_once(&onceToken, ^{
 		xpc_object_t xargs = xpc_dictionary_create_empty();
 		xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_DYLD_PATCH_ENABLED_GET, xargs);
+		xpc_release(xargs);
 		if (xreply) {
 			int64_t result = xpc_dictionary_get_int64(xreply, "result");
 			if(result == 0) {
@@ -254,6 +287,7 @@ int jbclient_set_dyld_patch(bool enabled)
     xpc_object_t xargs = xpc_dictionary_create_empty();
 	xpc_dictionary_set_bool(xargs, "enabled", enabled);
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_DYLD_PATCH_ENABLED_SET, xargs);
+	xpc_release(xargs);
 	if (xreply) {
 		int64_t result = xpc_dictionary_get_int64(xreply, "result");
 		xpc_release(xreply);

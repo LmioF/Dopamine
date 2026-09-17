@@ -17,8 +17,9 @@
 #import <dlfcn.h>
 #import <sys/stat.h>
 #import "NSString+Version.h"
+#import "DOBootstrapTransaction.h"
 
-#define LIBKRW_DOPAMINE_BUNDLED_VERSION @"2.0.3"
+#define LIBKRW_DOPAMINE_BUNDLED_VERSION @"2.0.5"
 #define LIBROOT_DOPAMINE_BUNDLED_VERSION @"1.0.1"
 #define BASEBIN_LINK_BUNDLED_VERSION @"1.0.0"
 #define LAUNCHCTL_BUNDLED_VERSION @"1:1.1.1-2+dp3.1"
@@ -494,21 +495,30 @@ NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
 - (NSString *)installedVersionForPackageWithIdentifier:(NSString *)identifier
 {
     NSString *dpkgStatus = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/var/lib/dpkg/status") encoding:NSUTF8StringEncoding error:nil];
-    NSString *packageStartLine = [NSString stringWithFormat:@"Package: %@", identifier];
-    
-    NSArray *packageInfos = [dpkgStatus componentsSeparatedByString:@"\n\n"];
-    for (NSString *packageInfo in packageInfos) {
-        if ([packageInfo hasPrefix:packageStartLine]) {
-            __block NSString *version = nil;
-            [packageInfo enumerateLinesUsingBlock:^(NSString * _Nonnull line, BOOL * _Nonnull stop) {
-                if ([line hasPrefix:@"Version: "]) {
-                    version = [line substringFromIndex:9];
+    __block NSString *installedVersion = nil;
+    NSMutableDictionary<NSString *, NSString *> *fields = [NSMutableDictionary dictionary];
+    [[dpkgStatus stringByAppendingString:@"\n\n"] enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        if (!line.length) {
+            if ([fields[@"Package"] isEqualToString:identifier]) {
+                NSArray<NSString *> *status = [[fields[@"Status"] componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+                    filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF != ''"]];
+                if (status.count == 3 && [status[1] isEqualToString:@"ok"] && [status[2] isEqualToString:@"installed"] && fields[@"Version"].length) {
+                    installedVersion = fields[@"Version"];
                 }
-            }];
-            return version;
+                *stop = YES;
+            }
+            [fields removeAllObjects];
+            return;
         }
-    }
-    return nil;
+        if ([NSCharacterSet.whitespaceCharacterSet characterIsMember:[line characterAtIndex:0]]) return;
+        NSRange separator = [line rangeOfString:@":"];
+        if (separator.location == NSNotFound) return;
+        NSString *field = [line substringToIndex:separator.location];
+        if ([field isEqualToString:@"Package"] || [field isEqualToString:@"Status"] || [field isEqualToString:@"Version"]) {
+            fields[field] = [[line substringFromIndex:NSMaxRange(separator)] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        }
+    }];
+    return installedVersion;
 }
 
 - (NSError *)installPackageManagers
@@ -533,7 +543,7 @@ NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
     NSString *installedVersion = [self installedVersionForPackageWithIdentifier:identifier];
     if (!installedVersion) return YES;
     
-    return [installedVersion compareVersion:bundledVersion] == NSOrderedAscending;
+    return [installedVersion compareDebianVersion:bundledVersion] == NSOrderedAscending;
 }
 
 #if 0
@@ -939,24 +949,16 @@ int getCFMajorVersion(void)
     //jbrootPrefix() and jbrand_current() unavailable
     
     NSFileManager* fm = NSFileManager.defaultManager;
-    
-    ASSERT( [fm moveItemAtPath:[NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", prev_jbrand]
-                        toPath:[NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", new_jbrand] error:nil] );
-    
-    ASSERT([fm moveItemAtPath:[NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", prev_jbrand]
-                       toPath:[NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", new_jbrand] error:nil]);
-    
-    
-    NSString* jbroot_path = [NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", new_jbrand];
-    NSString* jbroot_secondary = [NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", new_jbrand];
-    
-    ASSERT([fm removeItemAtPath:[jbroot_path stringByAppendingPathComponent:@"/private/var"] error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:[jbroot_path stringByAppendingPathComponent:@"/private/var"]
-                    withDestinationPath:[jbroot_secondary stringByAppendingPathComponent:@"/var"] error:nil]);
-    
-    ASSERT([fm removeItemAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"] error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"]
-                    withDestinationPath:jbroot_path error:nil]);
+    NSString *primaryParent = @"/var/containers/Bundle/Application";
+    NSString *secondaryParent = @"/var/mobile/Containers/Shared/AppGroup";
+    NSString *journalPath = [secondaryParent stringByAppendingPathComponent:@".dopamine-rerandomize.plist"];
+    NSError *transactionError = nil;
+    if (!RHBootstrapBeginRerandomization(fm, primaryParent, secondaryParent,
+                                         prev_jbrand, new_jbrand, journalPath, nil, &transactionError)) {
+        completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedReplacing
+                                   userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Bootstrap rerandomization interrupted: %@", transactionError.localizedDescription]}]);
+        return -1;
+    }
     
     find_jbroot(YES); //refresh
     
@@ -969,8 +971,27 @@ int getCFMajorVersion(void)
     
     NSFileManager* fm = NSFileManager.defaultManager;
     
+    NSString *primaryParent = @"/var/containers/Bundle/Application";
+    NSString *secondaryParent = @"/var/mobile/Containers/Shared/AppGroup";
+    NSString *journalPath = [secondaryParent stringByAppendingPathComponent:@".dopamine-rerandomize.plist"];
+    BOOL recoveredTransaction = NO;
+    BOOL repairedLegacyPair = NO;
+    NSError *transactionError = nil;
+    if (!RHBootstrapRecoverRerandomization(fm, primaryParent, secondaryParent, journalPath,
+                                           &recoveredTransaction, &transactionError)) {
+        completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedReplacing
+                                   userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed recovering interrupted bootstrap rerandomization: %@", transactionError.localizedDescription]}]);
+        return -1;
+    }
+    if (!RHBootstrapRepairLegacyPair(fm, primaryParent, secondaryParent, &repairedLegacyPair, &transactionError)) {
+        completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedReplacing
+                                   userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed repairing bootstrap root pair: %@", transactionError.localizedDescription]}]);
+        return -1;
+    }
+    if (recoveredTransaction || repairedLegacyPair) find_jbroot(YES);
+
     int installedCount=0;
-    NSString* dirpath = @"/var/containers/Bundle/Application/";
+    NSString* dirpath = [primaryParent stringByAppendingString:@"/"];
     NSArray *subItems = [fm contentsOfDirectoryAtPath:dirpath error:nil];
     for (NSString *subItem in subItems)
     {
@@ -992,7 +1013,7 @@ int getCFMajorVersion(void)
 
         STRAPLOG("remove unknown/unfinished jbroot %@", subItem);
 
-        NSString* jbroot_secondary = [NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/%@", subItem];
+        NSString* jbroot_secondary = [secondaryParent stringByAppendingPathComponent:subItem];
         if([fm fileExistsAtPath:jbroot_secondary]) {
             ASSERT([fm removeItemAtPath:jbroot_secondary error:nil]);
         }
@@ -1025,8 +1046,13 @@ int getCFMajorVersion(void)
         
         STRAPLOG("Status: Rerandomize jbroot");
         
-        if([self ReRandomizeBootstrap:completion] != 0) {
-            return -1;
+        if (!(recoveredTransaction || repairedLegacyPair)) {
+            if([self ReRandomizeBootstrap:completion] != 0) {
+                return -1;
+            }
+        }
+        else {
+            find_jbroot(YES);
         }
     }
     
@@ -1289,7 +1315,12 @@ int getCFMajorVersion(void)
     }
 
     
-    [[NSString stringWithFormat:@"%d",DOPAMINE_INSTALL_VERSION] writeToFile:jbrootPrefix(@"/.installed_dopamine") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *installationMarker = [NSString stringWithFormat:@"%d",DOPAMINE_INSTALL_VERSION];
+    NSError *markerError = nil;
+    if (![installationMarker writeToFile:jbrootPrefix(@"/.installed_dopamine") atomically:YES encoding:NSUTF8StringEncoding error:&markerError]) {
+        return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising
+                               userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to persist bootstrap installation marker: %@", markerError.localizedDescription]}];
+    }
     roothide_bootlog("bootstrap: writing installation markers");
     
     if(jbclient_palehide_present()) {
@@ -1326,6 +1357,11 @@ int getCFMajorVersion(void)
             if(![fm removeItemAtPath:[dirpath stringByAppendingPathComponent:item] error:&error])
                 return error;
         }
+    }
+
+    NSString *journalPath = [dirpath stringByAppendingPathComponent:@".dopamine-rerandomize.plist"];
+    if (RHBootstrapPathExistsNoFollow(journalPath) && ![fm removeItemAtPath:journalPath error:&error]) {
+        return error;
     }
     
     return nil;

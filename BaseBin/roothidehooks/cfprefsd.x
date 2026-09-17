@@ -3,6 +3,7 @@
 #include <roothide.h>
 #include <bsm/libbsm.h>
 #include "common.h"
+#include "request_scope.h"
 
 void xpc_connection_get_audit_token(xpc_connection_t connection, audit_token_t *token);
 
@@ -94,17 +95,8 @@ BOOL new_CFPrefsGetPathForTriplet(CFStringRef identifier, CFStringRef user, BOOL
 	return orig;
 }
 
-void* (*orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__)(id self, xpc_object_t message, xpc_connection_t connection, void* replyHandler);
-void* (*LEGACY_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__)(id self, SEL selector, xpc_object_t message, xpc_connection_t connection, void* replyHandler);
-void* DISPATCH_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self, xpc_object_t message, xpc_connection_t connection, void* replyHandler)
-{
-	if(@available(iOS 17.0, *)) {
-		return orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(self, message, connection, replyHandler);
-	} else {
-		return LEGACY_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(self, nil, message, connection, replyHandler);
-	}
-}
-void* new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self, xpc_object_t message, xpc_connection_t connection, void* replyHandler)
+void* (*orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__)(id self, SEL selector, xpc_object_t message, xpc_connection_t connection, void* replyHandler);
+void* new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self, SEL selector, xpc_object_t message, xpc_connection_t connection, void* replyHandler)
 {
     audit_token_t clientToken = {0};
     xpc_connection_get_audit_token(connection, &clientToken);
@@ -117,13 +109,14 @@ void* new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self, xpc_obje
 	// NSLog(@"CFPrefsDaemon: handleMessage Operation=%lld, msg=%s", xpc_dictionary_get_int64(message, "CFPreferencesOperation"), desc);
 	// if(desc) free(desc);
 
-	gCurrentClientPid = clientPid;
-
-	return DISPATCH_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(self, message, connection, replyHandler);
-}
-void* LEGACY_new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self, SEL selector, xpc_object_t message, xpc_connection_t connection, void* replyHandler)
-{
-	return new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(self, message, connection, replyHandler);
+	RHPidScope clientScope = rhPidScopeBegin(&gCurrentClientPid, clientPid);
+	void *result = NULL;
+	@try {
+		result = orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(self, selector, message, connection, replyHandler);
+	} @finally {
+		rhPidScopeEnd(&gCurrentClientPid, clientScope);
+	}
+	return result;
 }
 
 void cfprefsdInit(void)
@@ -142,13 +135,10 @@ void cfprefsdInit(void)
 	void* __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__ = MSFindSymbol(coreFoundationImage, "-[CFPrefsDaemon handleMessage:fromPeer:replyHandler:]");
 	if(__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__)
 	{
-		if(@available(iOS 17.0, *)) {
-			MSHookFunction(__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, (void *)new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, (void **)&orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__);
-			NSLog(@"hook __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__ %p => %p : %p", __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__);
-		} else {
-			MSHookFunction(__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, (void *)LEGACY_new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, (void **)&LEGACY_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__);
-			NSLog(@"hook __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__ %p => %p : %p", __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, LEGACY_new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, LEGACY_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__);
-		}
+		MSHookFunction(__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, (void *)new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, (void **)&orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__);
+		NSLog(@"hook __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__ %p => %p : %p", __CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__, orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__);
+	} else {
+		NSLog(@"CFPrefsDaemon message hook unavailable; preference hiding will degrade without request identity");
 	}
 
 	%init();

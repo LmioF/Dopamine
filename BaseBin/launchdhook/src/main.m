@@ -175,7 +175,10 @@ __attribute__((constructor)) static void initializer(void)
 		hookd_provider_init();
 		litehook_hook_memory = litehook_hook_memory_hookd;
 		litehook_hook_function(mach_vm_protect, mach_vm_protect_fixed);
-		init_hookd_external_support();
+			if (init_hookd_external_support() != 0) {
+				abort_with_reason(7, 1, "Dopamine: Failed to initialize external hookd support.", 0);
+				return;
+			}
 		roothide_bootlog("launchd: hookd initialization complete");
 	}
 

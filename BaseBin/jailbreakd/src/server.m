@@ -2,6 +2,7 @@
 #include <bsm/libbsm.h>
 #include <libproc.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 
 #include <libjailbreak/libjailbreak.h>
@@ -39,16 +40,29 @@ void jailbreakd_received_message(mach_port_t port)
 			JBLogError("xpc_pipe_receive error %d", err);
 			return;
 		}
+		if (!message || xpc_get_type(message) != XPC_TYPE_DICTIONARY) return;
 
 		xpc_object_t reply = xpc_dictionary_create_reply(message);
+		if (!reply) return;
+		xpc_object_t identifier = xpc_dictionary_get_value(message, "id");
+		if (!identifier || xpc_get_type(identifier) != XPC_TYPE_UINT64) {
+			xpc_dictionary_set_int64(reply, "result", EINVAL);
+			jailbreakd_reply_message(0, reply);
+			return;
+		}
+		uint64_t rawId = xpc_uint64_get_value(identifier);
+		if (rawId > INT_MAX) {
+			xpc_dictionary_set_int64(reply, "result", ENOTSUP);
+			jailbreakd_reply_message(0, reply);
+			return;
+		}
 
-		JBD_MESSAGE_ID msgId = xpc_dictionary_get_uint64(message, "id");
+			JBD_MESSAGE_ID msgId = (JBD_MESSAGE_ID)rawId;
 		
 		if (xpc_get_type(message) == XPC_TYPE_DICTIONARY) {
 			audit_token_t auditToken = {0};
 			xpc_dictionary_get_audit_token(message, &auditToken);
-			uid_t clientUid = audit_token_to_euid(auditToken);
-			pid_t clientPid = audit_token_to_pid(auditToken);
+				pid_t clientPid = audit_token_to_pid(auditToken);
 
 			char* desc = NULL;
 			JBLogDebug("received message %d from %d(%s) with dictionary: %s", msgId, clientPid, proc_get_path(clientPid,NULL), (desc=xpc_copy_description(message)));
@@ -155,9 +169,14 @@ void jailbreakd_received_message(mach_port_t port)
 					break;
 				}
 
-				case JBD_MSG_SYSTEMWIDE_LOG: {
+					case JBD_MSG_SYSTEMWIDE_LOG: {
 #ifdef ENABLE_LOGS
-					static char logFilePath[PATH_MAX] = {0};
+						const char* log = xpc_dictionary_get_string(message, "log");
+						if (!log) {
+							xpc_dictionary_set_int64(reply, "result", EINVAL);
+							break;
+						}
+						static char logFilePath[PATH_MAX] = {0};
 					static dispatch_once_t onceToken;
 					dispatch_once(&onceToken, ^{
 						JBLogGetLogFilePath("systemwide", NULL, logFilePath);
@@ -169,27 +188,40 @@ void jailbreakd_received_message(mach_port_t port)
 						progname = strrchr(procpath, '/');
 						if(progname) progname++; else progname = procpath;
 					}
-					uint64_t tid = xpc_dictionary_get_uint64(message, "tid");
-					const char* log = xpc_dictionary_get_string(message, "log");
-					JBLogFunction(logFilePath, clientPid, tid, progname ? progname : "(null)", "%s", log);
+						uint64_t tid = xpc_dictionary_get_uint64(message, "tid");
+						JBLogFunction(logFilePath, clientPid, tid, progname ? progname : "(null)", "%s", log);
 					xpc_dictionary_set_int64(reply, "result", 0);
 #else
-					abort();
+						xpc_dictionary_set_int64(reply, "result", ENOTSUP);
 #endif
 					break;
 				}
 
-				case JBD_MSG_TEST_CALL: {
-					int value = xpc_dictionary_get_int64(message, "value");
-					JBLogDebug("jailbreakd test call(%llu) from %d,%s", value, clientPid, proc_get_path(clientPid,NULL));	
-					xpc_dictionary_set_int64(reply, "result", value * 2);
-					
-					if(clientUid == 0) {
-						abort(); // crashreporter test
-					}
+					case JBD_MSG_TEST_CALL: {
+						xpc_object_t input = xpc_dictionary_get_value(message, "value");
+						if (!input || xpc_get_type(input) != XPC_TYPE_INT64) {
+							xpc_dictionary_set_int64(reply, "result", EINVAL);
+							break;
+						}
+						int64_t value = xpc_int64_get_value(input);
+						if (value < INT_MIN / 2 || value > INT_MAX / 2) {
+							xpc_dictionary_set_int64(reply, "result", ERANGE);
+							break;
+						}
+						JBLogDebug("jailbreakd test call(%lld) from %d,%s", value, clientPid, proc_get_path(clientPid,NULL));
+						xpc_dictionary_set_int64(reply, "result", value * 2);
 
-					break;
-				}
+#ifdef ENABLE_CRASH_TESTS
+						if (audit_token_to_euid(auditToken) == 0) {
+							abort(); // crashreporter test
+						}
+#endif
+
+						break;
+					}
+					default:
+						xpc_dictionary_set_int64(reply, "result", ENOTSUP);
+						break;
 			}
 		}
 		if (reply) {

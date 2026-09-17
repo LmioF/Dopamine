@@ -54,6 +54,8 @@ void proc_remove_msg_filter(uint64_t proc);
 uint64_t proc_get_vnode_for_fd(uint64_t proc, int fd);
 int fd_attach_signature(int fd, fsignatures_t *signature);
 void proc_ucred_update(uint64_t proc, uint64_t newUcred);
+int ucred_read_groups(uint64_t ucred, gid_t groups[NGROUPS_MAX], uint32_t *ngroups);
+int proc_ucred_update_content_counted(uint64_t proc, const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, const gid_t *groups, uint32_t ngroups);
 int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, gid_t groups[NGROUPS_MAX]);
 
 uint64_t vm_page_for_pnum(uint64_t pnum);

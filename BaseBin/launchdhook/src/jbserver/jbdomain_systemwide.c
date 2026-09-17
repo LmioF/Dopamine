@@ -4,6 +4,7 @@
 #include <sandbox.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+#include <errno.h>
 
 #include <libjailbreak/hookd.h>
 #include <libjailbreak/signatures.h>
@@ -16,6 +17,7 @@
 
 #include <signal.h>
 #include <libjailbreak/roothider.h>
+#include <libjailbreak/jbserver.h>
 
 /*
 bool gSystemwideDomainEnabled = true;
@@ -27,6 +29,28 @@ void systemwide_domain_set_enabled(bool enabled)
 
 extern bool string_has_prefix(const char *str, const char* prefix);
 extern bool string_has_suffix(const char* str, const char* suffix);
+
+static int validate_sandbox_extensions_for_checkin(const char *sandboxExtensions)
+{
+	if (!sandboxExtensions || sandboxExtensions[0] == '\0') return EACCES;
+	size_t length = strnlen(sandboxExtensions, JBSERVER_SANDBOX_EXTENSIONS_MAX);
+	if (length >= JBSERVER_SANDBOX_EXTENSIONS_MAX) return EOVERFLOW;
+
+	int tokenCount = 1;
+	bool tokenHasData = false;
+	for (const char *it = sandboxExtensions; *it; it++) {
+		if (*it == '|') {
+			if (!tokenHasData) return EPROTO;
+			tokenCount++;
+			tokenHasData = false;
+		}
+		else {
+			tokenHasData = true;
+		}
+	}
+	if (!tokenHasData || tokenCount != 3) return EPROTO;
+	return 0;
+}
 
 char *combine_strings(char separator, char **components, int count)
 {
@@ -99,6 +123,7 @@ static int systemwide_get_boot_uuid(char **bootUUIDOut)
 int systemwide_trust_file(audit_token_t *processToken, int rfd, struct siginfo *siginfo, size_t siginfoSize, bool attach)
 {
 	if (siginfo && siginfoSize != sizeof(struct siginfo)) return -1;
+	if (rfd < 0) { errno = EBADF; return -1; }
 
 	pid_t pid = -1;
 	int fd = -1;
@@ -108,10 +133,41 @@ int systemwide_trust_file(audit_token_t *processToken, int rfd, struct siginfo *
 	}
 	else {
 		pid = audit_token_to_pid(*processToken);
-		struct vnode_fdinfowithpath vnodeInfo;
+		struct vnode_fdinfowithpath vnodeInfo = {0};
 		int ok = proc_pidfdinfo(pid, rfd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, sizeof(vnodeInfo));
-		if (ok > 0) {
-			fd = open(vnodeInfo.pvip.vip_path, O_RDONLY);
+		if (ok != sizeof(vnodeInfo)) {
+			if (ok >= 0 || !errno) errno = EIO;
+			return -1;
+		}
+		if (!vnodeInfo.pvip.vip_path[0] || !memchr(vnodeInfo.pvip.vip_path, '\0', sizeof(vnodeInfo.pvip.vip_path))) {
+			errno = EINVAL;
+			return -1;
+		}
+		fd = open(vnodeInfo.pvip.vip_path, O_RDONLY);
+		if (fd < 0) return -1;
+		struct stat status;
+		int identityError = 0;
+		if (fstat(fd, &status) != 0) {
+			identityError = errno ? errno : EIO;
+		} else if ((uint32_t)status.st_dev != vnodeInfo.pvip.vip_vi.vi_stat.vst_dev ||
+			(uint64_t)status.st_ino != vnodeInfo.pvip.vip_vi.vi_stat.vst_ino ||
+			(uint32_t)status.st_gen != vnodeInfo.pvip.vip_vi.vi_stat.vst_gen) {
+			identityError = ESTALE;
+		}
+		if (!identityError) {
+			struct vnode_fdinfowithpath current = {0};
+			ok = proc_pidfdinfo(pid, rfd, PROC_PIDFDVNODEPATHINFO, &current, sizeof(current));
+			if (ok != sizeof(current)) identityError = ok < 0 && errno ? errno : EIO;
+			else if (current.pvip.vip_vi.vi_stat.vst_dev != vnodeInfo.pvip.vip_vi.vi_stat.vst_dev ||
+				current.pvip.vip_vi.vi_stat.vst_ino != vnodeInfo.pvip.vip_vi.vi_stat.vst_ino ||
+				current.pvip.vip_vi.vi_stat.vst_gen != vnodeInfo.pvip.vip_vi.vi_stat.vst_gen) {
+				identityError = ESTALE;
+			}
+		}
+		if (identityError) {
+			close(fd);
+			errno = identityError;
+			return -1;
 		}
 	}
 
@@ -242,13 +298,21 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 	bool isPlatformProcess = (csflags & CS_PLATFORM_BINARY) != 0;
 
 	// Generate sandbox extensions for the requesting process
-	*sandboxExtensionsOut = generate_sandbox_extensions(processToken, isPlatformProcess);
-	if(!(*sandboxExtensionsOut)) {
-		JBLogError("Failed to generate sandbox extensions for process %d", pid);
-	}
+		*sandboxExtensionsOut = generate_sandbox_extensions(processToken, isPlatformProcess);
+		int sandboxExtensionsResult = validate_sandbox_extensions_for_checkin(*sandboxExtensionsOut);
+		if(sandboxExtensionsResult != 0) {
+			JBLogError("Failed to generate sandbox extensions for process %d", pid);
+			free(*rootPathOut);
+			free(*bootUUIDOut);
+			free(*sandboxExtensionsOut);
+			*rootPathOut = NULL;
+			*bootUUIDOut = NULL;
+			*sandboxExtensionsOut = NULL;
+			return sandboxExtensionsResult;
+		}
 
 	bool fullyDebugged = false;
-	if (isRemovableBundlePath(procPath) || isSubPathOf(JBROOT_PATH("/Applications"), procPath)) {
+	if (isRemovableBundlePath(procPath) || isSubPathOf(procPath, JBROOT_PATH("/Applications"))) {
 /*************************************** roothide specific *********************************/
 		
 		// This is an app, enable CS_DEBUGGED based on user preference
@@ -271,7 +335,8 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 			uint64_t ucred = proc_ucred(proc);
 
 			gid_t groups[NGROUPS_MAX];
-			kreadbuf(ucred + koffsetof(ucred, groups), groups, sizeof(groups));
+			uint32_t ngroups;
+			if (ucred_read_groups(ucred, groups, &ngroups) != 0) return -1;
 
 			int uid = kread32(ucred + koffsetof(ucred, uid)), gid = groups[0];
 			int ruid = kread32(ucred + koffsetof(ucred, ruid)), rgid = kread32(ucred + koffsetof(ucred, rgid));
@@ -286,7 +351,7 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 				}
 
 				if (old_uid != uid || old_gid != gid) {
-					if (proc_ucred_update_content(proc, procPath, uid, gid, ruid, rgid, groups) != 0) return -1;
+				if (proc_ucred_update_content_counted(proc, procPath, uid, gid, ruid, rgid, groups, ngroups) != 0) return -1;
 				}
 				if (sb.st_mode & S_ISUID) kwrite32(proc + koffsetof(proc, svuid), uid);
 				if (sb.st_mode & S_ISGID) kwrite32(proc + koffsetof(proc, svgid), gid);
@@ -554,7 +619,8 @@ static int systemwide_persona_fix(audit_token_t *callerToken, int childPid, uid_
 	uint64_t childUcred = proc_ucred(childProc);
 
 	gid_t groups[NGROUPS_MAX];
-	kreadbuf(childUcred + koffsetof(ucred, groups), groups, sizeof(groups));
+	uint32_t ngroups;
+	if (ucred_read_groups(childUcred, groups, &ngroups) != 0) return -1;
 
 	int uid = kread32(childUcred + koffsetof(ucred, uid)), gid = groups[0];
 	int ruid = kread32(childUcred + koffsetof(ucred, ruid)), rgid = kread32(childUcred + koffsetof(ucred, rgid));
@@ -569,7 +635,7 @@ static int systemwide_persona_fix(audit_token_t *callerToken, int childPid, uid_
 
 	if (old_uid != uid || old_gid != gid) {
 		if (old_gid != gid) groups[0] = gid;
-		if (proc_ucred_update_content(childProc, childProcPath, uid, gid, uid, gid, groups) != 0) return -1;
+		if (proc_ucred_update_content_counted(childProc, childProcPath, uid, gid, uid, gid, groups, ngroups) != 0) return -1;
 	}
 	if (overwriteUid != -1) kwrite32(childProc + koffsetof(proc, svuid), uid);
 	if (overwriteGid != -1) kwrite32(childProc + koffsetof(proc, svgid), gid);
@@ -602,8 +668,8 @@ struct jbserver_domain gSystemwideDomain = {
 			.args = (jbserver_arg[]){
 				{ .name = "caller-token", .type = JBS_TYPE_CALLER_TOKEN, .out = false },
 				{ .name = "fd", .type = JBS_TYPE_UINT64, .out = false },
-				{ .name = "siginfo", .type = JBS_TYPE_DATA, .out = false },
-				{ .name = "attach", .type = JBS_TYPE_BOOL, .out = false },
+				{ .name = "siginfo", .type = JBS_TYPE_DATA, .out = false, .optional = true },
+				{ .name = "attach", .type = JBS_TYPE_BOOL, .out = false, .optional = true },
 				{ 0 },
 			},
 		},

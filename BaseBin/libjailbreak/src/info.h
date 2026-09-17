@@ -116,7 +116,12 @@ struct system_info {
 /************** roothide specfic ***********/
 		uint64_t nchashtbl;
 		uint64_t nchashmask;
-		uint64_t launch_env_logging;
+			uint64_t namecache_rw_lock;
+			uint64_t lck_rw_lock_exclusive;
+			uint64_t lck_rw_done;
+			uint64_t vnode_ref_ext;
+			uint64_t vnode_rele_ext;
+			uint64_t launch_env_logging;
 		uint64_t developer_mode_status;
 /************** roothide specfic ***********/
 	} kernelSymbol;
@@ -202,6 +207,7 @@ struct system_info {
 			uint32_t uid;
 			uint32_t ruid;
 			uint32_t svuid;
+			uint32_t ngroups;
 			uint32_t groups;
 			uint32_t rgid;
 			uint32_t svgid;
@@ -440,6 +446,11 @@ extern struct system_info gSystemInfo;
 	\
 	iterator(ctx, kernelSymbol.nchashtbl); \
 	iterator(ctx, kernelSymbol.nchashmask); \
+	iterator(ctx, kernelSymbol.namecache_rw_lock); \
+	iterator(ctx, kernelSymbol.lck_rw_lock_exclusive); \
+	iterator(ctx, kernelSymbol.lck_rw_done); \
+	iterator(ctx, kernelSymbol.vnode_ref_ext); \
+	iterator(ctx, kernelSymbol.vnode_rele_ext); \
 	iterator(ctx, kernelSymbol.launch_env_logging); \
 	iterator(ctx, kernelSymbol.developer_mode_status); \
 	\
@@ -553,6 +564,7 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelStruct.ucred.uid); \
 	iterator(ctx, kernelStruct.ucred.ruid); \
 	iterator(ctx, kernelStruct.ucred.svuid); \
+	iterator(ctx, kernelStruct.ucred.ngroups); \
 	iterator(ctx, kernelStruct.ucred.groups); \
 	iterator(ctx, kernelStruct.ucred.rgid); \
 	iterator(ctx, kernelStruct.ucred.svgid); \

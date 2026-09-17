@@ -2,6 +2,44 @@
 #include <roothide.h>
 #import <fcntl.h>
 #include "common.h"
+#include "request_scope.h"
+
+static int fcntlCommandTakesArgument(int cmd)
+{
+	switch (cmd) {
+		case F_GETFD:
+#ifdef F_GETFL
+		case F_GETFL:
+#endif
+#ifdef F_GETOWN
+		case F_GETOWN:
+#endif
+#ifdef F_FULLFSYNC
+		case F_FULLFSYNC:
+#endif
+#ifdef F_FREEZE_FS
+		case F_FREEZE_FS:
+#endif
+#ifdef F_THAW_FS
+		case F_THAW_FS:
+#endif
+#ifdef F_GETPROTECTIONCLASS
+		case F_GETPROTECTIONCLASS:
+#endif
+#ifdef F_GETNOSIGPIPE
+		case F_GETNOSIGPIPE:
+#endif
+#ifdef F_GETPROTECTIONLEVEL
+		case F_GETPROTECTIONLEVEL:
+#endif
+#ifdef F_BARRIERFSYNC
+		case F_BARRIERFSYNC:
+#endif
+			return 0;
+		default:
+			return 1;
+	}
+}
 
 %hookf(int, fcntl, int fildes, int cmd, ...) {
 	if (cmd == F_SETPROTECTIONCLASS) {
@@ -14,21 +52,16 @@
 		}
 	}
 
-	va_list a;
-	va_start(a, cmd);
-	const char *arg1 = va_arg(a, void *);
-	const void *arg2 = va_arg(a, void *);
-	const void *arg3 = va_arg(a, void *);
-	const void *arg4 = va_arg(a, void *);
-	const void *arg5 = va_arg(a, void *);
-	const void *arg6 = va_arg(a, void *);
-	const void *arg7 = va_arg(a, void *);
-	const void *arg8 = va_arg(a, void *);
-	const void *arg9 = va_arg(a, void *);
-	const void *arg10 = va_arg(a, void *);
-	va_end(a);
-	return %orig(fildes, cmd, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10);
-}
+		if (!fcntlCommandTakesArgument(cmd)) {
+			return %orig(fildes, cmd);
+		}
+
+		va_list a;
+		va_start(a, cmd);
+		uintptr_t arg = va_arg(a, uintptr_t);
+		va_end(a);
+		return %orig(fildes, cmd, arg);
+	}
 
 @interface XBSnapshotContainerIdentity : NSObject
 @property NSString* bundleIdentifier;
@@ -67,9 +100,7 @@ static const void *kDenyQueryTagKey = &kDenyQueryTagKey;
 	NSURL* executableURL = [result performSelector:@selector(executableURL)];
 	NSLog(@"FBSApplicationLibrary applicationInfoForBundleIdentifier %@ : %@, %@", bundleIdentifier, result, executableURL);
 
-	NSNumber* tag = objc_getAssociatedObject(bundleIdentifier, kDenyQueryTagKey);
-
-	if(tag && tag.boolValue) {
+	if(rhAssociatedFlagIsActive(bundleIdentifier, kDenyQueryTagKey)) {
 
 		if(is_sensitive_app_identifier(bundleIdentifier.UTF8String)) {
 			NSLog(@"FBSApplicationLibrary deny query %@", bundleIdentifier);
@@ -91,22 +122,37 @@ static const void *kDenyQueryTagKey = &kDenyQueryTagKey;
 {
 	NSLog(@"openApplication %@ withOptions:%@ originator:%@ requestID:%@ completion:%p", bundleIdentifier, options, originator, requestID, completion);
 
-	id currentContext = [NSClassFromString(@"BSServiceConnection") performSelector:@selector(currentContext)];
-	id remoteProcess = [currentContext performSelector:@selector(remoteProcess)]; //BSProcessHandle
+	Class serviceConnectionClass = NSClassFromString(@"BSServiceConnection");
+	id currentContext = [serviceConnectionClass respondsToSelector:@selector(currentContext)] ? [serviceConnectionClass performSelector:@selector(currentContext)] : nil;
+	id remoteProcess = [currentContext respondsToSelector:@selector(remoteProcess)] ? [currentContext performSelector:@selector(remoteProcess)] : nil; //BSProcessHandle
 
-	NSNumber* _pid = [remoteProcess valueForKey:@"_pid"];
-	NSString* _bundleID = [remoteProcess valueForKey:@"_bundleID"]; //may be nil
+	NSNumber* _pid = nil;
+	NSString* _bundleID = nil;
+	@try {
+		_pid = [remoteProcess valueForKey:@"_pid"];
+		_bundleID = [remoteProcess valueForKey:@"_bundleID"]; //may be nil
+	} @catch(NSException *exception) {
+		NSLog(@"openApplication request context unavailable: %@", exception);
+	}
 
 	pid_t pid = _pid.intValue;
 
 	NSLog(@"openApplication %@ from pid=%d bundleID=%@", bundleIdentifier, pid, _bundleID);
 
-	if(jbclient_blacklist_check_pid(pid)==true) {
+	BOOL denyQueryScope = NO;
+	if(pid > 0 && jbclient_blacklist_check_pid(pid)==true) {
 		NSLog(@"openApplication deny request from %@", _bundleID);
-		objc_setAssociatedObject(bundleIdentifier, kDenyQueryTagKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		rhAssociatedFlagScopeBegin(bundleIdentifier, kDenyQueryTagKey);
+		denyQueryScope = YES;
 	}
 
-	return %orig;
+	void *result = NULL;
+	@try {
+		result = %orig;
+	} @finally {
+		if(denyQueryScope) rhAssociatedFlagScopeEnd(bundleIdentifier, kDenyQueryTagKey);
+	}
+	return result;
 }
 %end
 

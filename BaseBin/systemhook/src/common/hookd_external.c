@@ -8,6 +8,8 @@
 #include <util.h>
 #include <ptrauth.h>
 #include <pthread.h>
+#include <errno.h>
+#include <stdlib.h>
 #include <os/log.h>
 #include <libjailbreak/jbroot.h>
 #include <substrate.h>
@@ -25,42 +27,20 @@ uint64_t gShellcodeCurIdx = 0;
 
 uint32_t arm64_gen_b(vm_address_t origin, vm_address_t target)
 {
-	int32_t offset = (target - origin) / 4;
-
-	if(offset < 0)
-	{
-		if((offset & 0b1111110000000000000000000000000) != 0b1111110000000000000000000000000) {
-			return 0;
-		}
-	}
-	else
-	{
-		if((offset & 0b1111110000000000000000000000000) != 0) {
-			return 0;
-		}
-	}
-
-	return 0b00010100000000000000000000000000 | (offset & 0b00000011111111111111111111111111);
+	int64_t displacement = (int64_t)target - (int64_t)origin;
+	if ((displacement & 3) != 0) return 0;
+	int64_t offset = displacement / 4;
+	if (offset < -(1LL << 25) || offset >= (1LL << 25)) return 0;
+	return 0x14000000U | ((uint32_t)offset & 0x03FFFFFFU);
 }
 
 uint32_t arm64_gen_bl(vm_address_t origin, vm_address_t target)
 {
-	int32_t offset = (target - origin) / 4;
-
-	if(offset < 0)
-	{
-		if((offset & 0b1111110000000000000000000000000) != 0b1111110000000000000000000000000) {
-			return 0;
-		}
-	}
-	else
-	{
-		if((offset & 0b1111110000000000000000000000000) != 0) {
-			return 0;
-		}
-	}
-
-	return 0b10010100000000000000000000000000 | (offset & 0b00000011111111111111111111111111);
+	int64_t displacement = (int64_t)target - (int64_t)origin;
+	if ((displacement & 3) != 0) return 0;
+	int64_t offset = displacement / 4;
+	if (offset < -(1LL << 25) || offset >= (1LL << 25)) return 0;
+	return 0x94000000U | ((uint32_t)offset & 0x03FFFFFFU);
 }
 
 int emit_hookd_svc_trampoline(uint32_t *patchpoint, uint32_t *shellcode, size_t *emittedSize)
@@ -81,35 +61,63 @@ int emit_hookd_svc_trampoline(uint32_t *patchpoint, uint32_t *shellcode, size_t 
 	if (!replacementInsn || !curShc[callIdx] || !curShc[jmpbackIdx]) return -1;
 
 	int r = litehook_hook_memory(shellcode, curShc, sizeof(curShc));
-	r |= litehook_hook_memory(patchpoint, &replacementInsn, sizeof(replacementInsn));
+	if (r != 0) return r;
+	r = litehook_hook_memory(patchpoint, &replacementInsn, sizeof(replacementInsn));
+	if (r != 0) return r;
 
 	if (emittedSize) *emittedSize = oneShcSize;
-
-	return r;
+	return 0;
 }
 
 int apply_hookd_syscall_patches(uint32_t *textPtr, size_t textSize)
 {
+	const size_t shcPageSize = 0x4000;
+	const size_t oneShcWords = (size_t)(hook_trampoline_template_end - hook_trampoline_template);
+	if (oneShcWords == 0 || oneShcWords > (shcPageSize / sizeof(uint32_t))) return -1;
+
+	size_t siteCount = 0;
+	for (uint64_t i = 0; i < (textSize / sizeof(uint32_t)); i++) {
+		if (textPtr[i] == 0xd4001001) siteCount++;
+	}
+	if (siteCount > (shcPageSize / (oneShcWords * sizeof(uint32_t)))) return -1;
+	if (siteCount == 0) return 0;
+
 	vm_address_t shcPage = 0;
 	uint64_t off = 0;
 
 	for (uint64_t i = 0; i < (textSize / sizeof(uint32_t)); i++) {
 		if (textPtr[i] == 0xd4001001) /* svc 0x80 */ {
 			if (shcPage == 0) {
-				kern_return_t kr = vm_allocate_nearby(mach_task_self(), (vm_address_t)textPtr, (vm_size_t)textSize, &shcPage, 0x4000, (1ULL << 21));
+					kern_return_t kr = vm_allocate_nearby(mach_task_self(), (vm_address_t)textPtr, (vm_size_t)textSize, &shcPage, shcPageSize, (1ULL << 21));
 				if (kr != KERN_SUCCESS) {
 					return -1;
 				}
 			}
-			size_t emittedSize = 0;
-			int r = emit_hookd_svc_trampoline(&textPtr[i], &((uint32_t *)shcPage)[off], &emittedSize);
-			if (r == 0) {
+				size_t emittedSize = 0;
+				int r = emit_hookd_svc_trampoline(&textPtr[i], &((uint32_t *)shcPage)[off], &emittedSize);
+				if (r != 0) return r;
+				if (emittedSize != oneShcWords || off > (shcPageSize / sizeof(uint32_t)) - emittedSize) return -1;
 				off += emittedSize;
 			}
 		}
-	}
 
 	return 0;
+}
+
+static bool hookd_prologue_is_pc_independent(const uint32_t *instructions, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		uint32_t insn = instructions[i];
+		if ((insn & 0x1F000000U) == 0x10000000U || /* ADR/ADRP */
+			(insn & 0x7C000000U) == 0x14000000U || /* B/BL */
+			(insn & 0xFF000010U) == 0x54000000U || /* B.cond */
+			(insn & 0x7E000000U) == 0x34000000U || /* CBZ/CBNZ */
+			(insn & 0x7E000000U) == 0x36000000U || /* TBZ/TBNZ */
+			(insn & 0x3B000000U) == 0x18000000U) { /* literal load/prefetch */
+			return false;
+		}
+	}
+	return true;
 }
 
 static void image_loaded(const struct mach_header* mh, intptr_t vmaddr_slide)
@@ -181,14 +189,20 @@ int find_frida_text(void (^foundHandler)(uint32_t *ptr, size_t size))
 
 
 
-void *(*gOrigThreadRoutine)(void *) = NULL;
+typedef struct {
+	void *(*routine)(void *);
+	void *argument;
+} ThreadStartContext;
+
 void *pthread_handler_hook(void *arg)
 {
+	ThreadStartContext context = *(ThreadStartContext *)arg;
+	free(arg);
 	find_frida_text(^(uint32_t *fridaTextPtr, size_t fridaSize){
 		apply_hookd_syscall_patches(fridaTextPtr, fridaSize);
 	});
 
-	return gOrigThreadRoutine(arg);
+	return context.routine(context.argument);
 }
 
 int (*_pthread_create_orig)(pthread_t *restrict thread,
@@ -203,14 +217,18 @@ int _pthread_create_hook(pthread_t *restrict thread,
 {
 	if (!get_tpidrr0_el0()) {
 		// When frida calls it, it will always be from a thread that doesn't have TPIDRRO_EL0 set
-		gOrigThreadRoutine = start_routine;
-		return _pthread_create_orig(thread, attr, pthread_handler_hook, arg, whatever);
+		ThreadStartContext *context = malloc(sizeof(*context));
+		if (!context) return ENOMEM;
+		*context = (ThreadStartContext){ .routine = start_routine, .argument = arg };
+		int result = _pthread_create_orig(thread, attr, pthread_handler_hook, context, whatever);
+		if (result != 0) free(context);
+		return result;
 	}
 
 	return _pthread_create_orig(thread, attr, start_routine, arg, whatever);
 }
 
-void init_hookd_external_support(void)
+int init_hookd_external_support(void)
 {
 	_dyld_register_func_for_add_image(image_loaded);
 
@@ -221,21 +239,35 @@ void init_hookd_external_support(void)
 	// If we find it, we need to manually apply the hooks to inline syscalls to make it work on iOS 26
 
 	void *_pthread_create_ptr = litehook_find_dsc_symbol("/usr/lib/system/libsystem_pthread.dylib", "__pthread_create");
-	if (!_pthread_create_ptr) return;
+	if (!_pthread_create_ptr) return ENOENT;
 
 	void *_pthread_create_ptr_unsigned = ptrauth_strip((void *)_pthread_create_ptr, ptrauth_key_function_pointer);
 
-	vm_address_t shcPage;
-	vm_allocate(mach_task_self(), &shcPage, 0x4000, VM_FLAGS_ANYWHERE);
+	vm_address_t shcPage = 0;
+	kern_return_t kr = vm_allocate(mach_task_self(), &shcPage, 0x4000, VM_FLAGS_ANYWHERE);
+	if (kr != KERN_SUCCESS) return EIO;
 
 	// We cannot get an allocation within 2^21 of _pthread_create, so we cannot use direct branches
 	// Our only option is to use 4 mov's into x16 and a br x16
 	// This orig trampoline assumes that the first 5 instructions of _pthread_create are PC-independent
-	// They should always be, but if that at some point is not the case then we have a problem...
 	uint32_t *fridaHookOrigShc = (uint32_t *)shcPage;
+	if (!hookd_prologue_is_pc_independent((const uint32_t *)_pthread_create_ptr_unsigned, 5)) {
+		vm_deallocate(mach_task_self(), shcPage, 0x4000);
+		return ENOTSUP;
+	}
 	memcpy(fridaHookOrigShc, _pthread_create_ptr_unsigned, sizeof(uint32_t) * 5);
-	litehook_hook_function(ptrauth_sign_unauthenticated(&fridaHookOrigShc[5], ptrauth_key_function_pointer, 0), ptrauth_sign_unauthenticated((void *)((uintptr_t)_pthread_create_ptr_unsigned + sizeof(uint32_t) * 5), ptrauth_key_function_pointer, 0));
+	kr = litehook_hook_function(ptrauth_sign_unauthenticated(&fridaHookOrigShc[5], ptrauth_key_function_pointer, 0), ptrauth_sign_unauthenticated((void *)((uintptr_t)_pthread_create_ptr_unsigned + sizeof(uint32_t) * 5), ptrauth_key_function_pointer, 0));
+	if (kr != KERN_SUCCESS) {
+		vm_deallocate(mach_task_self(), shcPage, 0x4000);
+		return EIO;
+	}
 	_pthread_create_orig = (void *)ptrauth_sign_unauthenticated(fridaHookOrigShc, ptrauth_key_function_pointer, 0);
 
-	litehook_hook_function(_pthread_create_ptr, _pthread_create_hook);
+	kr = litehook_hook_function(_pthread_create_ptr, _pthread_create_hook);
+	if (kr != KERN_SUCCESS) {
+		_pthread_create_orig = NULL;
+		vm_deallocate(mach_task_self(), shcPage, 0x4000);
+		return EIO;
+	}
+	return 0;
 }

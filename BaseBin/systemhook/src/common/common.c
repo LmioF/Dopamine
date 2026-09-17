@@ -10,6 +10,11 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <pthread.h>
+#include <errno.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <stddef.h>
 #include <dlfcn.h>
 #include "envbuf.h"
 #include "private.h"
@@ -54,13 +59,16 @@ bool string_has_suffix(const char* str, const char* suffix)
 
 void string_enumerate_components(const char *string, const char *separator, void (^enumBlock)(const char *pathString, bool *stop))
 {
+	if (!string || !separator || !enumBlock) return;
 	char *stringCopy = strdup(string);
-	char *curString = strtok(stringCopy, separator);
+	if (!stringCopy) return;
+	char *state = NULL;
+	char *curString = strtok_r(stringCopy, separator, &state);
 	while (curString != NULL) {
 		bool stop = false;
 		enumBlock(curString, &stop);
 		if (stop) break;
-		curString = strtok(NULL, separator);
+		curString = strtok_r(NULL, separator, &state);
 	}
 	free(stringCopy);
 }
@@ -77,48 +85,106 @@ int timespec_compare(struct timespec *t1, struct timespec *t2)
 	}
 }
 
-xpc_object_t xpc_object_from_plist(const char *path)
+static bool config_file_matches(const struct stat *left, const struct stat *right)
 {
-	xpc_object_t xObj = NULL;
-	int ldFd = open(path, O_RDONLY);
-	if (ldFd >= 0) {
-		struct stat s = {};
-		if(fstat(ldFd, &s) != 0) {
-			close(ldFd);
-			return NULL;
-		}
-		size_t len = s.st_size;
-		void *addr = mmap(NULL, len, PROT_READ, MAP_FILE | MAP_PRIVATE, ldFd, 0);
-		if (addr != MAP_FAILED) {
-			close(ldFd);
-
-			xObj = xpc_create_from_plist(addr, len);
-			munmap(addr, len);
-		}
-	}
-	return xObj;
+	return left->st_dev == right->st_dev && left->st_ino == right->st_ino && left->st_size == right->st_size &&
+		left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec && left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+		left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec && left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
 }
 
-xpc_object_t jbuserconfig_get_value(const char *key)
+static xpc_object_t config_read_plist(const char *path, struct stat *loadedStat)
 {
-	const char *configPath = JBROOT_PATH("/basebin/config.plist");
-	if (!access(configPath, R_OK)) {
-		static xpc_object_t configDict = NULL;
-		static struct timespec lastConfigWrite = { .tv_sec=0, .tv_nsec = 0 };
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return NULL;
+	struct stat before, after;
+	if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_size <= 0 || (uint64_t)before.st_size > SSIZE_MAX) {
+		close(fd);
+		return NULL;
+	}
+	size_t length = (size_t)before.st_size;
+	void *bytes = malloc(length);
+	if (!bytes) {
+		close(fd);
+		return NULL;
+	}
+	// Reading into owned storage avoids SIGBUS when an in-place writer truncates the plist.
+	size_t offset = 0;
+	while (offset < length) {
+		ssize_t received = read(fd, (uint8_t *)bytes + offset, length - offset);
+		if (received < 0 && errno == EINTR) continue;
+		if (received <= 0) break;
+		offset += (size_t)received;
+	}
+	bool complete = offset == length && fstat(fd, &after) == 0 && config_file_matches(&before, &after);
+	close(fd);
+	xpc_object_t object = complete ? xpc_create_from_plist(bytes, length) : NULL;
+	free(bytes);
+	if (object && loadedStat) *loadedStat = after;
+	return object;
+}
 
-		struct stat configStat;
-		if (stat(configPath, &configStat) == 0) {
-			if (timespec_compare(&configStat.st_mtimespec, &lastConfigWrite) > 0) {
-				lastConfigWrite = configStat.st_mtimespec;
-				if (configDict) xpc_release(configDict);
-				configDict = xpc_object_from_plist(configPath);
-			}
+xpc_object_t xpc_object_from_plist(const char *path)
+{
+	return config_read_plist(path, NULL);
+}
+
+struct config_snapshot {
+	xpc_object_t dictionary;
+	struct stat identity;
+};
+
+static pthread_key_t configSnapshotKey;
+static pthread_once_t configSnapshotOnce = PTHREAD_ONCE_INIT;
+static int configSnapshotKeyError;
+
+static void config_snapshot_destroy(void *context)
+{
+	struct config_snapshot *snapshot = context;
+	if (snapshot->dictionary) xpc_release(snapshot->dictionary);
+	free(snapshot);
+}
+
+static void config_snapshot_initialize(void)
+{
+	configSnapshotKeyError = pthread_key_create(&configSnapshotKey, config_snapshot_destroy);
+}
+
+xpc_object_t jbuserconfig_copy_value(const char *key)
+{
+	if (!key || pthread_once(&configSnapshotOnce, config_snapshot_initialize) != 0 || configSnapshotKeyError) return NULL;
+	struct config_snapshot *snapshot = pthread_getspecific(configSnapshotKey);
+	if (!snapshot) {
+		snapshot = calloc(1, sizeof(*snapshot));
+		if (!snapshot) return NULL;
+		if (pthread_setspecific(configSnapshotKey, snapshot) != 0) {
+			free(snapshot);
+			return NULL;
 		}
-
-		return xpc_dictionary_get_value(configDict, key);
 	}
 
-	return NULL;
+	const char *configPath = JBROOT_PATH("/basebin/config.plist");
+	struct stat identity;
+	if (stat(configPath, &identity) != 0) {
+		if (errno == ENOENT && snapshot->dictionary) {
+			xpc_release(snapshot->dictionary);
+			snapshot->dictionary = NULL;
+		}
+	}
+	else if (!snapshot->dictionary || !config_file_matches(&identity, &snapshot->identity)) {
+		xpc_object_t replacement = config_read_plist(configPath, &identity);
+		if (replacement) {
+			if (xpc_get_type(replacement) == XPC_TYPE_DICTIONARY) {
+				xpc_object_t previous = snapshot->dictionary;
+				snapshot->dictionary = replacement;
+				snapshot->identity = identity;
+				if (previous) xpc_release(previous);
+			}
+			else xpc_release(replacement);
+		}
+	}
+	if (!snapshot->dictionary) return NULL;
+	xpc_object_t value = xpc_dictionary_get_value(snapshot->dictionary, key);
+	return value ? xpc_retain(value) : NULL;
 }
 
 kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[restrict])
@@ -137,21 +203,68 @@ kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[rest
 		if (!strcmp(processBlacklist[i], path)) return 0;
 	}
 
-	xpc_object_t userBlacklist = jbuserconfig_get_value("ProcessBlacklist");
+	kSpawnConfig result = kSpawnConfigInject | kSpawnConfigTrust;
+	xpc_object_t userBlacklist = jbuserconfig_copy_value("ProcessBlacklist");
 	if (userBlacklist && xpc_get_type(userBlacklist) == XPC_TYPE_ARRAY) {
 		size_t userBlacklistCount = xpc_array_get_count(userBlacklist);
 		for (size_t i = 0; i < userBlacklistCount; i++) {
-			if (!strcmp(xpc_array_get_string(userBlacklist, i), path)) return kSpawnConfigTrust;
+			xpc_object_t item = xpc_array_get_value(userBlacklist, i);
+			const char *entry = xpc_get_type(item) == XPC_TYPE_STRING ? xpc_string_get_string_ptr(item) : NULL;
+			if (entry && !strcmp(entry, path)) {
+				result = kSpawnConfigTrust;
+				break;
+			}
 		}
 	}
-
-	return (kSpawnConfigInject | kSpawnConfigTrust);
+	if (userBlacklist) xpc_release(userBlacklist);
+	return result;
 }
 
 // 1. Ensure the binary about to be spawned and all of it's dependencies are trust cached
 // 2. Insert "DYLD_INSERT_LIBRARIES=/usr/lib/systemhook.dylib" into all binaries spawned
 // 3. Increase Jetsam limit to more sane value (Multipler defined as JETSAM_MULTIPLIER)
 // 4. Fix spawning as root via persona entitlement on iOS 17.6+
+
+static int copy_spawn_attributes(const struct _posix_spawn_args_desc *source, struct _posix_spawn_args_desc *copy,
+								void **ownedAttributes, void **ownedPersona)
+{
+	*ownedAttributes = NULL;
+	*ownedPersona = NULL;
+	*copy = *source;
+	if (!source->attrp) return 0;
+	if (source->attr_size < POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE + sizeof(int)) return EINVAL;
+
+	void *attributes = malloc(source->attr_size);
+	if (!attributes) return ENOMEM;
+	memcpy(attributes, source->attrp, source->attr_size);
+
+	const void *persona = source->persona_info;
+	size_t personaSize = source->persona_info_size;
+	bool hasPersonaSlot = source->attr_size >= POSIX_SPAWNATTR_OFF_PERSONA + sizeof(void *);
+	if (!persona && hasPersonaSlot) {
+		memcpy(&persona, (uint8_t *)source->attrp + POSIX_SPAWNATTR_OFF_PERSONA, sizeof(persona));
+		if (persona) personaSize = sizeof(struct _posix_spawn_persona_info);
+	}
+	if (persona) {
+		if (personaSize < offsetof(struct _posix_spawn_persona_info, pspi_gid) + sizeof(gid_t)) {
+			free(attributes);
+			return EINVAL;
+		}
+		void *personaCopy = malloc(personaSize);
+		if (!personaCopy) {
+			free(attributes);
+			return ENOMEM;
+		}
+		memcpy(personaCopy, persona, personaSize);
+		if (hasPersonaSlot) memcpy((uint8_t *)attributes + POSIX_SPAWNATTR_OFF_PERSONA, &personaCopy, sizeof(personaCopy));
+		copy->persona_info = personaCopy;
+		copy->persona_info_size = personaSize;
+		*ownedPersona = personaCopy;
+	}
+	copy->attrp = (posix_spawnattr_t)attributes;
+	*ownedAttributes = attributes;
+	return 0;
+}
 
 static int spawn_exec_hook_common(bool isExec,
 						   const char *path,
@@ -160,11 +273,21 @@ static int spawn_exec_hook_common(bool isExec,
 		struct _posix_spawn_args_desc *desc,
 								 int (*trust_binary)(const char *path),
 								double jetsamMultiplier,
-								 int (^orig)(pid_t *pid, char *const envp[restrict]))
+									 int (^orig)(pid_t *pid, char *const envp[restrict], struct _posix_spawn_args_desc *patchedDesc))
 {
-	if (!path) {
-		return orig(NULL, envp);
-	}
+		if (!path) {
+			return orig(NULL, envp, desc);
+		}
+
+		struct _posix_spawn_args_desc privateDesc;
+		void *ownedAttributes = NULL;
+		void *ownedPersona = NULL;
+		int r = 0;
+		if (desc) {
+			r = copy_spawn_attributes(desc, &privateDesc, &ownedAttributes, &ownedPersona);
+			if (r != 0) return r;
+			desc = &privateDesc;
+		}
 
 	bool personaFixNeedsResume = true;
 	int personaFixUid = -1;
@@ -243,12 +366,14 @@ static int spawn_exec_hook_common(bool isExec,
 			if (jetsamMultiplier == 0 || isnan(jetsamMultiplier)) jetsamMultiplier = 3; // default value (3x)
 			if (jetsamMultiplier > 1) {
 				int memlimit_active = *(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE);
-				if (memlimit_active != -1) {
-					*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE) = memlimit_active * jetsamMultiplier;
+					if (memlimit_active > 0) {
+						double scaled = memlimit_active * jetsamMultiplier;
+						*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE) = scaled >= INT_MAX ? INT_MAX : (int)scaled;
 				}
 				int memlimit_inactive = *(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE);
-				if (memlimit_inactive != -1) {
-					*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE) = memlimit_inactive * jetsamMultiplier;
+					if (memlimit_inactive > 0) {
+						double scaled = memlimit_inactive * jetsamMultiplier;
+						*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE) = scaled >= INT_MAX ? INT_MAX : (int)scaled;
 				}
 			}
 		}
@@ -260,13 +385,11 @@ static int spawn_exec_hook_common(bool isExec,
 		if (__builtin_available(iOS 17.6, *)) {
 			bool hasExecFlag = false;
 			short flags = 0;
-			if (posix_spawnattr_getflags(&attr, &flags) == 0) {
-				if (flags & POSIX_SPAWN_SETEXEC) {
-					hasExecFlag = true;
-				}
-			}
-			if (!hasExecFlag && !isExec && getuid() != 0) {
-				struct _posix_spawn_persona_info *personaInfo = *(struct _posix_spawn_persona_info **)(attrStruct + POSIX_SPAWNATTR_OFF_PERSONA);
+				r = posix_spawnattr_getflags(&attr, &flags);
+				if (r != 0) goto cleanup;
+				if (flags & POSIX_SPAWN_SETEXEC) hasExecFlag = true;
+				if (!hasExecFlag && !isExec && getuid() != 0) {
+					struct _posix_spawn_persona_info *personaInfo = desc->persona_info;
 				if (personaInfo) {
 					if (personaInfo->pspi_id == 99 && (personaInfo->pspi_flags & POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE)) {
 						if (personaInfo->pspi_flags & POSIX_SPAWN_PERSONA_UID) {
@@ -288,20 +411,21 @@ static int spawn_exec_hook_common(bool isExec,
 						personaFixNeedsResume = false;
 					}
 					else {
-						posix_spawnattr_setflags(&attr, flags | POSIX_SPAWN_START_SUSPENDED);
+							r = posix_spawnattr_setflags(&attr, flags | POSIX_SPAWN_START_SUSPENDED);
+							if (r != 0) goto cleanup;
 					}
 				}
 			}
 		}
 	}
 
-	int r = -1;
+		r = -1;
 
 	pid_t childPid = -1;
 
 	if ((shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 1) || (!shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 0 && !hasSafeModeVariable)) {
 		// we're already good, just call orig
-		r = orig(&childPid, envp);
+			r = orig(&childPid, envp, desc);
 	}
 	else {
 		// the state we want to be in is not the state we are in right now
@@ -350,7 +474,7 @@ static int spawn_exec_hook_common(bool isExec,
 			envbuf_unsetenv(&envc, "_MSSafeMode");
 		}
 
-		r = orig(&childPid, envc);
+			r = orig(&childPid, envc, desc);
 
 		envbuf_free(envc);
 	}
@@ -371,7 +495,10 @@ static int spawn_exec_hook_common(bool isExec,
 		}
 	}
 
-	return r;
+cleanup:
+		free(ownedPersona);
+		free(ownedAttributes);
+		return r;
 }
 
 int posix_spawn_hook_shared(pid_t *restrict pid, 
@@ -386,8 +513,8 @@ int posix_spawn_hook_shared(pid_t *restrict pid,
 {
 	int (*posix_spawn_orig)(pid_t *restrict, const char *restrict, struct _posix_spawn_args_desc *, char *const[restrict], char *const[restrict]) = orig;
 
-	int r = spawn_exec_hook_common(false, path, argv, envp, desc, trust_binary, jetsamMultiplier, ^int(pid_t *pidOut, char *const envp_patched[restrict]) {
-		int rr = posix_spawn_orig(pid ?: pidOut, path, desc, argv, envp_patched);
+		int r = spawn_exec_hook_common(false, path, argv, envp, desc, trust_binary, jetsamMultiplier, ^int(pid_t *pidOut, char *const envp_patched[restrict], struct _posix_spawn_args_desc *patchedDesc) {
+			int rr = posix_spawn_orig(pid ?: pidOut, path, patchedDesc, argv, envp_patched);
 		if (rr == 0 && pid && pidOut) {
 			*pidOut = *pid;
 		}
@@ -444,7 +571,7 @@ int execve_hook_shared(const char *path,
 {
 	int (*execve_orig)(const char *, char *const[], char *const[]) = orig;
 
-	int r = spawn_exec_hook_common(true, path, argv, envp, NULL, trust_binary, 0, ^int(pid_t *pidOut, char *const envp_patched[restrict]){
+		int r = spawn_exec_hook_common(true, path, argv, envp, NULL, trust_binary, 0, ^int(pid_t *pidOut, char *const envp_patched[restrict], struct _posix_spawn_args_desc *patchedDesc){
 		return execve_orig(path, argv, envp_patched);
 	});
 

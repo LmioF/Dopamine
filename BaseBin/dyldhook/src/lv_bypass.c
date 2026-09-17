@@ -6,6 +6,7 @@
 #include <sandbox.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <errno.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <libkern/OSByteOrder.h>
@@ -162,6 +163,23 @@ bool superblob_is_adhoc_signed(const CS_SuperBlob *superblob)
 	return true;
 }
 
+static int fcntl_trust_error(int status)
+{
+	int error = EIO;
+	switch (status) {
+		case KERN_INVALID_ARGUMENT: error = EINVAL; break;
+		case KERN_PROTECTION_FAILURE: error = EACCES; break;
+		case KERN_NO_SPACE:
+		case KERN_RESOURCE_SHORTAGE: error = ENOMEM; break;
+		case MACH_SEND_TIMED_OUT:
+		case MACH_RCV_TIMED_OUT: error = ETIMEDOUT; break;
+		case MACH_SEND_INVALID_DEST:
+		case MACH_RCV_PORT_DIED: error = EPIPE; break;
+	}
+	_simple_dprintf(STDERR_FILENO, "dyld trust-file request failed: %d\n", status);
+	return cerror(error);
+}
+
 int HOOK(__fcntl)(int fd, int cmd, void *arg1, void *arg2, void *arg3, void *arg4, void *arg5, void *arg6, void *arg7, void *arg8)
 {
 	// Disable LV bypass if this process does not have a bootstrap port
@@ -185,10 +203,10 @@ int HOOK(__fcntl)(int fd, int cmd, void *arg1, void *arg2, void *arg3, void *arg
 					int result = (int)msyscall_errno(0x5C, fd, cmd, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
 					if (result == 0 || !jbinfo_is_checked_in()) return result;
 				}
-				struct siginfo siginfo;
+					struct siginfo siginfo = {0};
 				siginfo.source = (cmd == F_ADDSIGS) ? SIGNATURE_SOURCE_PROC : SIGNATURE_SOURCE_FILE;
 				if (arg1) {
-					memcpy(&siginfo.signature, (fsignatures_t *)arg1, sizeof (fsignatures_t));
+						memcpy(&siginfo.signature, arg1, offsetof(fsignatures_t, fs_fsignatures_size));
 
 					if (jbinfo_should_force_cs_adhoc()) {
 						// Do whatever is neccessary to support non CS_ADHOC signed libraries on TXM devices
@@ -260,13 +278,8 @@ int HOOK(__fcntl)(int fd, int cmd, void *arg1, void *arg2, void *arg3, void *arg
 											siginfo.signature.fs_blob_start = (void *)superblob;
 
 											// Get everything done here: Trust modified signature and attach it
-											r = jbclient_mach_trust_file(fd, &siginfo, true);
-											if (r == 0) {
-												// Since we are replacing a call to F_FILESIGS_RETURN (the emphasis is on the RETURN) with F_ADDSIGS
-												// and there is no equivalent "RETURN" for that, we need to set the return value ourselves to satisfy dyld
-												((fsignatures_t *)arg1)->fs_file_start = (off_t)((fsignatures_t *)arg1)->fs_blob_start;
-											}
-											isFinished = true;
+												r = jbclient_mach_trust_file(fd, &siginfo, true);
+												isFinished = true;
 										}
 									}
 								}
@@ -277,8 +290,13 @@ int HOOK(__fcntl)(int fd, int cmd, void *arg1, void *arg2, void *arg3, void *arg
 							}
 						}
 
-						if (isFinished) {
-							return r;
+							if (isFinished) {
+								if (r != 0) return fcntl_trust_error(r);
+								if (cmd == F_ADDFILESIGS_RETURN || cmd == F_ADDFILESIGS_INFO) {
+									// Only the accepted kernel blob defines the end offset, CDHash and hash type.
+									return (int)msyscall_errno(0x5C, fd, cmd, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+								}
+								return 0;
 						}
 					}
 				}

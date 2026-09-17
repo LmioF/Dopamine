@@ -1040,8 +1040,42 @@ void proc_copy_ucred(uint64_t procCopyFrom, uint64_t procCopyTo)
 	proc_ucred_update(procCopyTo, ucredToCopy);
 }
 
-int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, gid_t groups[NGROUPS_MAX])
+int ucred_read_groups(uint64_t ucred, gid_t groups[NGROUPS_MAX], uint32_t *ngroups)
 {
+	if (!groups || !ngroups) { errno = EINVAL; return -1; }
+	*ngroups = 0;
+	memset(groups, 0, NGROUPS_MAX * sizeof(*groups));
+	uint32_t countOffset = koffsetof(ucred, ngroups);
+	uint32_t groupsOffset = koffsetof(ucred, groups);
+	if (!ucred || !countOffset || !groupsOffset) { errno = EINVAL; return -1; }
+	if (ucred > UINT64_MAX - countOffset - sizeof(uint16_t) ||
+		ucred > UINT64_MAX - groupsOffset - NGROUPS_MAX * sizeof(gid_t)) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	uint16_t count = 0;
+	if (kreadbuf(ucred + countOffset, &count, sizeof(count)) != 0) { errno = EIO; return -1; }
+	if (count == 0 || count > NGROUPS_MAX) { errno = EINVAL; return -1; }
+	gid_t snapshot[NGROUPS_MAX] = {0};
+	if (kreadbuf(ucred + groupsOffset, snapshot, count * sizeof(gid_t)) != 0) { errno = EIO; return -1; }
+	for (uint32_t i = 0; i < count; i++) {
+		if (snapshot[i] == (gid_t)-1) { errno = EINVAL; return -1; }
+	}
+	memcpy(groups, snapshot, sizeof(snapshot));
+	*ngroups = count;
+	return 0;
+}
+
+int target_proc_with_ucred_counted(const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, const gid_t *groups, uint32_t ngroups)
+{
+	if (!procPath || !procPath[0] || !groups || ngroups == 0 || ngroups > NGROUPS_MAX || groups[0] != gid ||
+		uid == (uid_t)-1 || ruid == (uid_t)-1 || gid == (gid_t)-1 || rgid == (gid_t)-1) {
+		errno = EINVAL;
+		return -1;
+	}
+	for (uint32_t i = 0; i < ngroups; i++) {
+		if (groups[i] == (gid_t)-1) { errno = EINVAL; return -1; }
+	}
 	int comPipe[2] = {-1, -1};
 	posix_spawn_file_actions_t act = NULL;
 	posix_spawnattr_t attr = NULL;
@@ -1063,28 +1097,26 @@ int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t rui
 	if ((error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED)) != 0) goto cleanup;
 
 	char uidString[12];
-	snprintf(uidString, sizeof(uidString), "%d", uid);
+	snprintf(uidString, sizeof(uidString), "%u", uid);
 
 	char gidString[12];
-	snprintf(gidString, sizeof(gidString), "%d", gid);
+	snprintf(gidString, sizeof(gidString), "%u", gid);
 
 	char ruidString[12];
-	snprintf(ruidString, sizeof(ruidString), "%d", ruid);
+	snprintf(ruidString, sizeof(ruidString), "%u", ruid);
 
 	char rgidString[12];
-	snprintf(rgidString, sizeof(rgidString), "%d", rgid);
+	snprintf(rgidString, sizeof(rgidString), "%u", rgid);
+
+	char countString[12];
+	snprintf(countString, sizeof(countString), "%u", ngroups);
 
 	char groupsStrings[NGROUPS_MAX][12];
-	for (int i = 0; i < NGROUPS_MAX; i++) {
-		snprintf(groupsStrings[i], sizeof(groupsStrings[i]), "%d", groups[i]);
+	for (uint32_t i = 0; i < ngroups; i++) {
+		snprintf(groupsStrings[i], sizeof(groupsStrings[i]), "%u", groups[i]);
 	}
 
-	// exec_path
-	// 6 options
-	// 5 options with one arg
-	// 1 option with NGROUPS_MAX args
-	// NULL
-	const char *argv[1 + 6 + (5 * 1) + (1 * NGROUPS_MAX) + 1];
+	const char *argv[1 + 7 + 6 + NGROUPS_MAX + 1];
 	int idx = 0;
 	argv[idx++] = procPath;
 	argv[idx++] = "--fd";
@@ -1097,8 +1129,10 @@ int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t rui
 	argv[idx++] = gidString;
 	argv[idx++] = "--rgid";
 	argv[idx++] = rgidString;
+	argv[idx++] = "--ngroups";
+	argv[idx++] = countString;
 	argv[idx++] = "--groups";
-	for (int i = 0; i < NGROUPS_MAX; i++) {
+	for (uint32_t i = 0; i < ngroups; i++) {
 		argv[idx++] = groupsStrings[i];
 	}
 	argv[idx++] = NULL;
@@ -1172,10 +1206,18 @@ cleanup:
 	return error == 0 ? pid : -1;
 }
 
-int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, gid_t groups[NGROUPS_MAX])
+int proc_ucred_update_content_counted(uint64_t proc, const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, const gid_t *groups, uint32_t ngroups)
 {
+	if (!proc || !groups || ngroups == 0 || ngroups > NGROUPS_MAX || groups[0] != gid ||
+		uid == (uid_t)-1 || ruid == (uid_t)-1 || gid == (gid_t)-1 || rgid == (gid_t)-1) {
+		errno = EINVAL;
+		return -1;
+	}
+	for (uint32_t i = 0; i < ngroups; i++) {
+		if (groups[i] == (gid_t)-1) { errno = EINVAL; return -1; }
+	}
 	if (__builtin_available(iOS 17.0, *)) {
-		int childPid = target_proc_with_ucred(procPath, uid, gid, ruid, rgid, groups);
+		int childPid = target_proc_with_ucred_counted(procPath, uid, gid, ruid, rgid, groups, ngroups);
 		if (childPid == -1) {
 			return -1;
 		}
@@ -1190,6 +1232,13 @@ int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gi
 	}
 	else {
 		uint64_t ucred = proc_ucred(proc);
+		if (!ucred || !koffsetof(ucred, ngroups)) { errno = EINVAL; return -1; }
+		uint16_t count = (uint16_t)ngroups;
+		if (kwritebuf(ucred + koffsetof(ucred, groups), groups, count * sizeof(gid_t)) != 0 ||
+			kwritebuf(ucred + koffsetof(ucred, ngroups), &count, sizeof(count)) != 0) {
+			errno = EIO;
+			return -1;
+		}
 
 		kwrite32(ucred + koffsetof(ucred, svuid), uid);
 		kwrite32(ucred + koffsetof(ucred, uid), uid);
@@ -1211,6 +1260,15 @@ int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gi
 	}
 
 	return 0;
+}
+
+int proc_ucred_update_content(uint64_t proc, const char *procPath, uid_t uid, gid_t gid, uid_t ruid, gid_t rgid, gid_t groups[NGROUPS_MAX])
+{
+	if (!proc || !groups) { errno = EINVAL; return -1; }
+	gid_t currentGroups[NGROUPS_MAX];
+	uint32_t count;
+	if (ucred_read_groups(proc_ucred(proc), currentGroups, &count) != 0) return -1;
+	return proc_ucred_update_content_counted(proc, procPath, uid, gid, ruid, rgid, groups, count);
 }
 
 uint64_t vm_page_for_pnum(uint64_t pnum)
@@ -1254,43 +1312,48 @@ uint64_t vm_page_for_pa(uint64_t pa)
 
 void killall(const char *executablePath, int signal)
 {
-	static int maxArgumentSize = 0;
-	if (maxArgumentSize == 0) {
-		size_t size = sizeof(maxArgumentSize);
-		if (sysctl((int[]){ CTL_KERN, KERN_ARGMAX }, 2, &maxArgumentSize, &size, NULL, 0) == -1) {
-			perror("sysctl argument size");
-			maxArgumentSize = 4096; // Default
-		}
+	if (!executablePath) return;
+	int maxArgumentSize = 0;
+	size_t argumentSizeLength = sizeof(maxArgumentSize);
+	if (sysctl((int[]){ CTL_KERN, KERN_ARGMAX }, 2, &maxArgumentSize, &argumentSizeLength, NULL, 0) < 0 ||
+		argumentSizeLength != sizeof(maxArgumentSize) || maxArgumentSize <= (int)sizeof(int)) {
+		maxArgumentSize = 4096;
 	}
 	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL};
 	struct kinfo_proc *info;
-	size_t length;
-	int count;
+	size_t length = 0;
 	
-	if (sysctl(mib, 3, NULL, &length, NULL, 0) < 0)
+	if (sysctl(mib, 3, NULL, &length, NULL, 0) < 0 || length == 0)
 		return;
 	if (!(info = malloc(length)))
 		return;
-	if (sysctl(mib, 3, info, &length, NULL, 0) < 0) {
+	size_t processCapacity = length;
+	if (sysctl(mib, 3, info, &length, NULL, 0) < 0 || length > processCapacity) {
 		free(info);
 		return;
 	}
-	count = length / sizeof(struct kinfo_proc);
-	for (int i = 0; i < count; i++) {
+	size_t argumentCapacity = (size_t)maxArgumentSize;
+	char *buffer = malloc(argumentCapacity);
+	if (!buffer) {
+		free(info);
+		return;
+	}
+	size_t count = length / sizeof(struct kinfo_proc);
+	for (size_t i = 0; i < count; i++) {
 		pid_t pid = info[i].kp_proc.p_pid;
-		if (pid == 0) {
+		if (pid <= 0) {
 			continue;
 		}
-		size_t size = maxArgumentSize;
-		char* buffer = (char *)malloc(length);
-		if (sysctl((int[]){ CTL_KERN, KERN_PROCARGS2, pid }, 3, buffer, &size, NULL, 0) == 0) {
+		size_t size = argumentCapacity;
+		if (sysctl((int[]){ CTL_KERN, KERN_PROCARGS2, pid }, 3, buffer, &size, NULL, 0) == 0 &&
+			size > sizeof(int) && size <= argumentCapacity) {
 			char *cExecutablePath = buffer + sizeof(int);
-			if (strcmp(cExecutablePath, executablePath) == 0) {
+			if (memchr(cExecutablePath, '\0', size - sizeof(int)) && strcmp(cExecutablePath, executablePath) == 0) {
 				kill(pid, signal);
 			}
 		}
-		free(buffer);
 	}
+	free(buffer);
 	free(info);
 }
 

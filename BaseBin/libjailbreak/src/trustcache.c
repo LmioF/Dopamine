@@ -188,20 +188,31 @@ uint64_t _jb_trustcache_grow(void)
 
 int jb_trustcache_add_entries(struct trustcache_entry_v1 *entries, uint32_t entryCount)
 {
+	if (entryCount == 0) return 0;
+	jb_trustcache *jbTc = alloca(JB_TRUSTCACHE_SIZE);
 	uint32_t remainingEntryCount = entryCount;
 	while (remainingEntryCount > 0) {
 		__block uint64_t freeJbTcKaddr = 0;
 		__block uint32_t freeJbTcCurrentLength = 0;
+		__block int readResult = 0;
 		_jb_trustcache_enumerate(^(uint64_t jbTcKaddr, bool *stop) {
-			uint32_t length = kread32(jbTcKaddr + offsetof(jb_trustcache, file.length));
+			uint32_t length = 0;
+			readResult = kreadbuf(jbTcKaddr + offsetof(jb_trustcache, file.length), &length, sizeof(length));
+			if (readResult != 0 || length > JB_TRUSTCACHE_ENTRY_COUNT) {
+				if (readResult == 0) readResult = -1;
+				*stop = true;
+				return;
+			}
 			if (length < JB_TRUSTCACHE_ENTRY_COUNT) {
 				freeJbTcKaddr = jbTcKaddr;
 				freeJbTcCurrentLength = length;
 				*stop = true;
 			}
 		});
+		if (readResult != 0) return readResult;
 		if (freeJbTcKaddr == 0) {
 			freeJbTcKaddr = _jb_trustcache_grow();
+			if (freeJbTcKaddr == 0) return -1;
 		}
 
 		uint32_t entryCountToInsert = JB_TRUSTCACHE_ENTRY_COUNT - freeJbTcCurrentLength;
@@ -209,14 +220,16 @@ int jb_trustcache_add_entries(struct trustcache_entry_v1 *entries, uint32_t entr
 			entryCountToInsert = remainingEntryCount;
 		}
 
-		jb_trustcache *jbTc = alloca(JB_TRUSTCACHE_SIZE);
-		kreadbuf(freeJbTcKaddr, jbTc, JB_TRUSTCACHE_SIZE);
+		readResult = kreadbuf(freeJbTcKaddr, jbTc, JB_TRUSTCACHE_SIZE);
+		if (readResult != 0) return readResult;
+		if (jbTc->file.length != freeJbTcCurrentLength) return -1;
 		for (uint32_t i = 0; i < entryCountToInsert; i++) {
-			jbTc->file.entries[freeJbTcCurrentLength+i] = entries[i];
+			jbTc->file.entries[freeJbTcCurrentLength+i] = entries[entryCount - remainingEntryCount + i];
 		}
 		jbTc->file.length += entryCountToInsert;
 		_trustcache_file_sort(&jbTc->file);
-		kwritebuf(freeJbTcKaddr, jbTc, JB_TRUSTCACHE_SIZE);
+		int writeResult = kwritebuf(freeJbTcKaddr, jbTc, JB_TRUSTCACHE_SIZE);
+		if (writeResult != 0) return writeResult;
 		remainingEntryCount -= entryCountToInsert;
 	}
 	return 0;
@@ -342,6 +355,18 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 		}
 	});
 
+	uint64_t tcKaddr = 0;
+	uint64_t retiredTcKaddr = 0;
+	uint64_t retiredTcSize = 0;
+	if (existingTcKaddr != 0) {
+		uint64_t prevTcFile = kread64(existingTcKaddr + koffsetof(trustcache, fileptr));
+		uint32_t prevTcLength = kread32(prevTcFile + offsetof(trustcache_file_v1, length));
+		uint64_t prevTcSize = ksizeof(trustcache) + sizeof(trustcache_file_v1) + (prevTcLength * sizeof(trustcache_entry_v1));
+		if (prevTcSize != tcSize && kalloc(&tcKaddr, tcSize) != 0) {
+			return -1;
+		}
+	}
+
 	// If so, we want to either replace it or remove it
 	if (existingTcKaddr != 0) {
 		if (_is_jb_trustcache(existingTcKaddr)) {
@@ -349,30 +374,26 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 			return -1;
 		}
 
-		uint64_t prevTcFile = kread64(existingTcKaddr + koffsetof(trustcache, fileptr));
-		uint32_t prevTcLength = kread32(prevTcFile + offsetof(trustcache_file_v1, length));
-		uint64_t prevTcSize = ksizeof(trustcache) + sizeof(trustcache_file_v1) + (prevTcLength * sizeof(trustcache_entry_v1));
+			uint64_t prevTcFile = kread64(existingTcKaddr + koffsetof(trustcache, fileptr));
+			uint32_t prevTcLength = kread32(prevTcFile + offsetof(trustcache_file_v1, length));
+			uint64_t prevTcSize = ksizeof(trustcache) + sizeof(trustcache_file_v1) + (prevTcLength * sizeof(trustcache_entry_v1));
 		if (prevTcSize == tcSize) {
 			// If size is the same this is simple, just replace the file data
 			kwritebuf(prevTcFile, tc, tcSize - ksizeof(trustcache));
 			return 0;
 		}
-		else {
-			// If not, it gets more complicated and hacky...
-			// We can't take a lock (at least not yet??) to ensure nothing accesses the original TrustCache after we freed it
-			// So we do the next best thing, we remove it from the linked list and wait a bit before freeing it, hoping that any
-			// outstanding reads on the memory would be done by then
-			if (trustcache_list_remove(existingTcKaddr) != 0) {
-				return -1; // really unlikely error, if this triggers the world is probably upside down
+			else {
+				// Keep the old allocation alive until the replacement has been fully populated and published.
+				// If publication fails we can restore the old list entry instead of losing both caches.
+				if (trustcache_list_remove(existingTcKaddr) != 0) {
+					return -1; // really unlikely error, if this triggers the world is probably upside down
+				}
+				retiredTcKaddr = existingTcKaddr;
+				retiredTcSize = prevTcSize;
 			}
-			usleep(10000); // hope for current accesses to finish if there are any (new accesses won't come as we removed the list entry)
-			kfree(existingTcKaddr, prevTcSize); // free the original allocation
-			// now just fall through and make this function add the new TrustCache
 		}
-	}
 
-	uint64_t tcKaddr = 0;
-	if (kalloc(&tcKaddr, tcSize) != 0) return -1;
+	if (tcKaddr == 0 && kalloc(&tcKaddr, tcSize) != 0) return -1;
 
 	// kalloc is not guaranteed to be zeroed, make sure trustcache head is zeroed
 	char nullBuf[ksizeof(trustcache)];
@@ -390,8 +411,20 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 		kwrite64(tcKaddr + koffsetof(trustcache, type), 0x5);
 	}
 
-	trustcache_list_insert(tcKaddr);
-	return 0;
+		if (trustcache_list_insert(tcKaddr) != 0) {
+			if (retiredTcKaddr != 0) {
+				trustcache_list_insert(retiredTcKaddr);
+			}
+			kfree(tcKaddr, tcSize);
+			return -1;
+		}
+
+		if (retiredTcKaddr != 0) {
+			// New readers now see the replacement. Give pre-existing readers the same grace period as before.
+			usleep(10000);
+			kfree(retiredTcKaddr, retiredTcSize);
+		}
+		return 0;
 }
 
 int trustcache_file_upload_with_uuid(trustcache_file_v1 *tc, uuid_t uuid)

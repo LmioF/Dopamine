@@ -67,3 +67,9 @@ _ffsys_close:
 	mov x16, #6
 	svc 0x80
 	ret
+
+.global _ffsys_poll
+_ffsys_poll:
+	mov x16, #230
+	svc 0x80
+	ret

@@ -35,6 +35,8 @@
 #import <libjailbreak/roothider/bootlog.h>
 #import <CoreServices/LSApplicationProxy.h>
 #import <sys/utsname.h>
+#import <stdatomic.h>
+#import <errno.h>
 #import "spawn.h"
 #import "clock_alarm.h"
 #import <IOSurface/IOSurfaceRef.h>
@@ -82,9 +84,9 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     if (txmPath) {
         NSLog(@"TXM at %@", txmPath);
     }
-    
+
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Patchfinding") debug:NO];
-    
+
     int r = xpf_start_with_kernel_path(kernelPath.fileSystemRepresentation, sptmPath ? sptmPath.fileSystemRepresentation : NULL, txmPath ? txmPath.fileSystemRepresentation : NULL);
     if (r == 0) {
         char *sets[99] = {
@@ -386,17 +388,22 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 struct boomerang_info {
     mach_port_t serverPort;
     dispatch_semaphore_t boomerangDone;
+    atomic_bool boomerangCancelled;
 };
 
 void *boomerang_server(struct boomerang_info *info)
 {
-    while (true) {
+    while (!atomic_load_explicit(&info->boomerangCancelled, memory_order_acquire)) {
         xpc_object_t xdict = nil;
-        if (!xpc_pipe_receive(info->serverPort, &xdict)) {
+        int receiveResult = xpc_pipe_receive(info->serverPort, &xdict);
+        if (!receiveResult) {
             if (jbserver_received_boomerang_xpc_message(&gBoomerangServer, xdict) == JBS_BOOMERANG_DONE) {
                 dispatch_semaphore_signal(info->boomerangDone);
                 break;
             }
+        }
+        else if (atomic_load_explicit(&info->boomerangCancelled, memory_order_acquire)) {
+            break;
         }
     }
     return NULL;
@@ -412,51 +419,93 @@ void *boomerang_server(struct boomerang_info *info)
         }
     }
     roothide_bootlog("app: launchd injection begin");
+    NSError *resultError = nil;
     // Host a boomerang server that will be used by launchdhook to get the jailbreak primitives from this app
     mach_port_t serverPort = MACH_PORT_NULL;
-    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &serverPort);
-    mach_port_insert_right(mach_task_self(), serverPort, serverPort, MACH_MSG_TYPE_MAKE_SEND);
-    
-    struct boomerang_info info;
-    info.serverPort = serverPort;
-    info.boomerangDone = dispatch_semaphore_create(0);
-    
-    pthread_t boomerangThread;
-    pthread_create(&boomerangThread, NULL, (void *(*)(void *))boomerang_server, &info);
-    pthread_detach(boomerangThread);
-
-    // Stash port to server in launchd's initPorts[2]
-    // Since we don't have the neccessary entitlements, we need to do it over jbctl
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_set_registered_ports_np(&attr, (mach_port_t[]){MACH_PORT_NULL, MACH_PORT_NULL, serverPort}, 3);
-    pid_t spawnedPid = 0;
-    const char *jbctlPath = JBROOT_PATH("/basebin/jbctl");
-    int spawnError = posix_spawn(&spawnedPid, jbctlPath, NULL, &attr, (char *const *)(const char *[]){ jbctlPath, "internal", "launchd_stash_port", NULL }, NULL);
-    if (spawnError != 0) {
-        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Spawning jbctl failed with error code %d", spawnError]}];
+    kern_return_t portKr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &serverPort);
+    if (portKr != KERN_SUCCESS) {
+        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : @"Failed to allocate primitive-transfer port"}];
     }
-    posix_spawnattr_destroy(&attr);
-    int status = 0;
+    portKr = mach_port_insert_right(mach_task_self(), serverPort, serverPort, MACH_MSG_TYPE_MAKE_SEND);
+    if (portKr != KERN_SUCCESS) {
+        mach_port_destroy(mach_task_self(), serverPort);
+        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : @"Failed to create primitive-transfer send right"}];
+    }
+
+    struct boomerang_info info = {
+        .serverPort = serverPort,
+        .boomerangDone = dispatch_semaphore_create(0),
+    };
+    atomic_init(&info.boomerangCancelled, false);
+
+    pthread_t boomerangThread = 0;
+    int threadError = pthread_create(&boomerangThread, NULL, (void *(*)(void *))boomerang_server, &info);
+    if (threadError != 0) {
+        mach_port_destroy(mach_task_self(), serverPort);
+        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Starting primitive-transfer receiver failed with error %d", threadError]}];
+    }
+
     do {
-        if (waitpid(spawnedPid, &status, 0) == -1) {
-            return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : @"Waiting for jbctl failed"}];
+        // Stash port to server in launchd's initPorts[2]
+        // Since we don't have the necessary entitlements, we need to do it over jbctl.
+        posix_spawnattr_t attr;
+        int attrError = posix_spawnattr_init(&attr);
+        if (attrError != 0) {
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Initializing jbctl spawn attributes failed with error %d", attrError]}];
+            break;
         }
-    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+        attrError = posix_spawnattr_set_registered_ports_np(&attr, (mach_port_t[]){MACH_PORT_NULL, MACH_PORT_NULL, serverPort}, 3);
+        if (attrError != 0) {
+            posix_spawnattr_destroy(&attr);
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Registering launchd stash port failed with error %d", attrError]}];
+            break;
+        }
+        pid_t spawnedPid = 0;
+        const char *jbctlPath = JBROOT_PATH("/basebin/jbctl");
+        int spawnError = posix_spawn(&spawnedPid, jbctlPath, NULL, &attr, (char *const *)(const char *[]){ jbctlPath, "internal", "launchd_stash_port", NULL }, NULL);
+        posix_spawnattr_destroy(&attr);
+        if (spawnError != 0) {
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Spawning jbctl failed with error code %d", spawnError]}];
+            break;
+        }
+        int status = 0;
+        while (waitpid(spawnedPid, &status, 0) == -1) {
+            if (errno == EINTR) continue;
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : @"Waiting for jbctl failed"}];
+            break;
+        }
+        if (resultError) break;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"jbctl launchd stash failed (status 0x%x)", status]}];
+            break;
+        }
 
-    // Inject launchdhook.dylib into launchd via opainject
-    int r = exec_cmd(JBROOT_PATH("/basebin/opainject"), "1", JBROOT_PATH("/basebin/launchdhook.dylib"), NULL);
-    roothide_bootlog("app: opainject returned");
-    if (r != 0) {
-        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"opainject failed with error code %d", r]}];
+        // Inject launchdhook.dylib into launchd via opainject.
+        int r = exec_cmd(JBROOT_PATH("/basebin/opainject"), "1", JBROOT_PATH("/basebin/launchdhook.dylib"), NULL);
+        roothide_bootlog("app: opainject returned");
+        if (r != 0) {
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"opainject failed with error code %d", r]}];
+            break;
+        }
+
+        // A successful injector exit only means the loader call completed. Require the
+        // primitive handoff itself to complete within a bounded startup window.
+        dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC);
+        if (dispatch_semaphore_wait(info.boomerangDone, deadline) != 0) {
+            resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : @"Timed out waiting for launchd primitive transfer"}];
+            break;
+        }
+        roothide_bootlog("app: launchd primitive transfer complete");
+    } while (false);
+
+    atomic_store_explicit(&info.boomerangCancelled, true, memory_order_release);
+    mach_port_destroy(mach_task_self(), serverPort);
+    int joinError = pthread_join(boomerangThread, NULL);
+    if (!resultError && joinError != 0) {
+        resultError = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Joining primitive-transfer receiver failed with error %d", joinError]}];
     }
 
-    // Wait for everything to finish
-    dispatch_semaphore_wait(info.boomerangDone, DISPATCH_TIME_FOREVER);
-    roothide_bootlog("app: launchd primitive transfer complete");
-    mach_port_deallocate(mach_task_self(), serverPort);
-
-    return nil;
+    return resultError;
 }
 
 /*
@@ -672,6 +721,16 @@ void *boomerang_server(struct boomerang_info *info)
     *errOut = [self elevatePrivileges];
 
     if (*errOut) return;
+
+    // Removal must not depend on repairing or rerandomizing a potentially interrupted
+    // bootstrap pair. At this point we are already root and unsandboxed, so deletion can
+    // enumerate and remove both stable root parents directly.
+    if (removeJailbreakEnabled) {
+        *errOut = [self removeJailbreak];
+        [self cleanUpPostExploitation];
+        if (!*errOut) *didRemove = YES;
+        return;
+    }
     *errOut = [self showNonDefaultSystemApps];
     if (*errOut) {
         [self cleanUpPostExploitation];
@@ -716,13 +775,6 @@ void *boomerang_server(struct boomerang_info *info)
     *errOut = [self loadBasebinTrustcache];
     if (*errOut) {
         [self cleanUpPostExploitation];
-        return;
-    }
-
-    if (removeJailbreakEnabled) {
-        *errOut = [self removeJailbreak];
-        [self cleanUpPostExploitation];
-        if (!*errOut) *didRemove = YES;
         return;
     }
 

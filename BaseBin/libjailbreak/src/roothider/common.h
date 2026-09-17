@@ -42,7 +42,7 @@ void register_job(pid_t pid);
 uint64_t get_job_cache(pid_t pid);
 
 bool isRemovableBundlePath(const char* path);
-bool isSubPathOf(const char* parent, const char* child); //not work for jbroot:/var/...
+bool isSubPathOf(const char* child, const char* parent); //not work for jbroot:/var/...
 
 bool string_has_prefix(const char *str, const char* prefix);
 bool string_has_suffix(const char* str, const char* suffix);

@@ -1,9 +1,11 @@
 #include <choma/Fat.h>
 #include <choma/MachO.h>
 #include <choma/Host.h>
+#include <choma/FileStream.h>
 #include <mach-o/dyld.h>
 #include "../trustcache.h"
 #include "../roothider.h"
+#include "../signatures.h"
 
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -46,6 +48,44 @@ MachO* fat_find_preferred_slice(Fat *fat)
 
 extern bool csd_superblob_is_adhoc_signed(CS_DecodedSuperBlob *superblob);
 
+typedef struct {
+	bool Valid;
+	uint32_t Type;
+	uint32_t Subtype;
+} executionArchInfo;
+
+static MachO *fat_find_execution_slice(Fat *fat, executionArchInfo *arch)
+{
+	if (!fat || !arch || !arch->Valid) return fat ? fat_find_preferred_slice(fat) : NULL;
+
+	MachO *macho = fat_find_slice(fat, arch->Type, arch->Subtype);
+	if (arch->Type != CPU_TYPE_ARM64) return macho;
+
+	uint32_t baseSubtype = arch->Subtype & ~CPU_SUBTYPE_MASK;
+	if (baseSubtype == CPU_SUBTYPE_ARM64E) {
+		bool requestsV2 = (arch->Subtype & CPU_SUBTYPE_ARM64E_ABI_V2) != 0;
+		if (macho && (requestsV2 || macho_get_filetype(macho) != MH_EXECUTE)) return macho;
+		macho = NULL;
+		if (!requestsV2) {
+			macho = fat_find_slice(fat, arch->Type, CPU_SUBTYPE_ARM64E | CPU_SUBTYPE_ARM64E_ABI_V2);
+			if (macho) return macho;
+		}
+		macho = fat_find_slice(fat, arch->Type, CPU_SUBTYPE_ARM64E);
+		if (macho && macho_get_filetype(macho) == MH_EXECUTE) macho = NULL;
+		if (!macho) macho = fat_find_slice(fat, arch->Type, CPU_SUBTYPE_ARM64_V8);
+		if (!macho) macho = fat_find_slice(fat, arch->Type, CPU_SUBTYPE_ARM64_ALL);
+		return macho;
+	}
+	if (macho) return macho;
+
+	if (baseSubtype == CPU_SUBTYPE_ARM64_V8) {
+		macho = fat_find_slice(fat, arch->Type, CPU_SUBTYPE_ARM64_ALL);
+	} else if (baseSubtype == CPU_SUBTYPE_ARM64_ALL) {
+		macho = fat_find_slice(fat, arch->Type, CPU_SUBTYPE_ARM64_V8);
+	}
+	return macho;
+}
+
 NSString* resolveLoaderExecutablePaths(NSString *loadPath, NSString *loaderPath, NSString *mainExecutablePath)
 {
 	if ([loadPath hasPrefix:@"@loader_path/"] || [loadPath isEqualToString:@"@loader_path"]) {
@@ -57,7 +97,7 @@ NSString* resolveLoaderExecutablePaths(NSString *loadPath, NSString *loaderPath,
 	return nil;
 };
 
-NSString* resolveRpaths(NSString *subPath, NSString *mainExecutablePath, NSArray* rpathStack)
+NSString* resolveRpaths(NSString *subPath, NSString *mainExecutablePath, NSArray* rpathStack, executionArchInfo *executionArch)
 {
 @autoreleasepool {
 
@@ -69,7 +109,7 @@ NSString* resolveRpaths(NSString *subPath, NSString *mainExecutablePath, NSArray
 	{
 		Fat *fat = fat_init_from_path(loaderPath.fileSystemRepresentation);
 		if (fat) {
-			MachO *macho = fat_find_preferred_slice(fat);
+				MachO *macho = fat_find_execution_slice(fat, executionArch);
 			if (macho) {
 				macho_enumerate_rpaths(macho, ^(const char *rpathCStr, bool *stop) {
 					NSString* possiblePath = [@(rpathCStr) stringByAppendingPathComponent:subPath];
@@ -97,12 +137,12 @@ NSString* resolveRpaths(NSString *subPath, NSString *mainExecutablePath, NSArray
 } //autoreleasepool
 }
 
-NSString *resolveLoadPath(NSString *loadPath, NSString *loaderPath, NSString *mainExecutablePath, NSString* workingDir, NSArray* rpathStack)
+NSString *resolveLoadPath(NSString *loadPath, NSString *loaderPath, NSString *mainExecutablePath, NSString* workingDir, NSArray* rpathStack, executionArchInfo *executionArch)
 {
 	if (!loadPath) return nil;
 
 	if ([loadPath hasPrefix:@"@rpath/"]) {
-		return resolveRpaths([loadPath substringFromIndex:(sizeof("@rpath/")-1)], mainExecutablePath, rpathStack);
+		return resolveRpaths([loadPath substringFromIndex:(sizeof("@rpath/")-1)], mainExecutablePath, rpathStack, executionArch);
 	}
 	
 	NSString *expandedPath = resolveLoaderExecutablePaths(loadPath, loaderPath, mainExecutablePath);
@@ -120,7 +160,7 @@ NSString *resolveLoadPath(NSString *loadPath, NSString *loaderPath, NSString *ma
 		JBLogDebug("Resolving relative path: %s", loadPath.fileSystemRepresentation);
 
 		//non-@ path is treated as an implicit @rpath first
-		NSString* resolvedPath = resolveRpaths(loadPath, mainExecutablePath, rpathStack);
+		NSString* resolvedPath = resolveRpaths(loadPath, mainExecutablePath, rpathStack, executionArch);
 
 		if(!resolvedPath && workingDir) {
 			resolvedPath = [workingDir stringByAppendingPathComponent:loadPath];
@@ -138,7 +178,16 @@ typedef struct {
 	uint32_t* Subtypes;
 } preferredArchInfo;
 
-static void recurse_handler(NSString *loadPath, NSString *loaderPath, NSString *mainExecutablePath, NSString *workingDir, NSMutableArray* fileCaches, NSMutableArray* rpathStack, preferredArchInfo* preferredArch, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut)
+static bool recursive_path_matches_open_file(const char *path, const struct stat *openedStat)
+{
+	struct stat currentStat = {0};
+	if (!path || !openedStat || stat(path, &currentStat) != 0) return false;
+	return currentStat.st_dev == openedStat->st_dev &&
+		currentStat.st_ino == openedStat->st_ino &&
+		currentStat.st_gen == openedStat->st_gen;
+}
+
+static int recurse_handler(NSString *loadPath, NSString *loaderPath, NSString *mainExecutablePath, NSString *workingDir, NSMutableArray* fileCaches, NSMutableArray* rpathStack, preferredArchInfo* preferredArch, executionArchInfo *executionArch, bool weakDependency, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut)
 {
 @autoreleasepool {
 
@@ -152,152 +201,229 @@ static void recurse_handler(NSString *loadPath, NSString *loaderPath, NSString *
 		}
 		return false;
 	};
-	void (^cdhashesAdd)(cdhash_t) = ^(cdhash_t cdhash) {
-		(*cdhashCountOut)++;
-		(*cdhashesOut) = realloc((*cdhashesOut), (*cdhashCountOut) * sizeof(cdhash_t));
-		memcpy((*cdhashesOut)[(*cdhashCountOut)-1], cdhash, sizeof(cdhash_t));
-	};
+		bool (^cdhashesAdd)(cdhash_t) = ^bool(cdhash_t cdhash) {
+			uint32_t newCount = (*cdhashCountOut) + 1;
+			cdhash_t *newHashes = realloc((*cdhashesOut), newCount * sizeof(cdhash_t));
+			if (!newHashes) return false;
+			(*cdhashesOut) = newHashes;
+			memcpy((*cdhashesOut)[newCount - 1], cdhash, sizeof(cdhash_t));
+			(*cdhashCountOut) = newCount;
+			return true;
+		};
 
 
-	NSString *resolvedLoadPath = resolveLoadPath(loadPath, loaderPath, mainExecutablePath, workingDir, rpathStack);
-	if(!resolvedLoadPath) {
-		JBLogError("Failed to resolve dependency library for %s (loader: %s, mainExecutable: %s)", loadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation, mainExecutablePath.fileSystemRepresentation);
-		return;
-	}
+			NSString *resolvedLoadPath = resolveLoadPath(loadPath, loaderPath, mainExecutablePath, workingDir, rpathStack, executionArch);
+		if(!resolvedLoadPath) {
+			JBLogError("Failed to resolve dependency library for %s (loader: %s, mainExecutable: %s)", loadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation, mainExecutablePath.fileSystemRepresentation);
+			return weakDependency ? 0 : -1;
+		}
 
-	if(_dyld_shared_cache_contains_path(resolvedLoadPath.fileSystemRepresentation)) {
-		DEBUG_LOG("Skipping dyld shared cached library: %s", resolvedLoadPath.fileSystemRepresentation);
-		return;
-	}
+		if(_dyld_shared_cache_contains_path(resolvedLoadPath.fileSystemRepresentation)) {
+			DEBUG_LOG("Skipping dyld shared cached library: %s", resolvedLoadPath.fileSystemRepresentation);
+			return 0;
+		}
 
 	char realfilepath[PATH_MAX] = {0};
-	int fd = open(resolvedLoadPath.fileSystemRepresentation, O_RDONLY);
-	if (fd < 0) {
-		JBLogError("Failed to open binary at path: %s (loader: %s)", resolvedLoadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation);
-		return;
-	}
-	if(fcntl(fd, F_GETPATH, realfilepath) != 0) {
-		JBLogError("Failed to get file path for fd %d", fd);
-		close(fd);
-		return;
-	}
-	close(fd);
-
-	if(string_has_prefix(realfilepath, "/private/preboot/Cryptexes/")) {
-		JBLogDebug("Skipping Cryptexes file: %s", realfilepath);
-		return;
-	}
-	
-	if(isRemovableBundlePath(realfilepath) && !hasTrollstoreLiteMarker(realfilepath)) {
-		// ignore adhoc signed apps(removable system apps or other stuffs) which is not installed via tslite
-		JBLogDebug("ignoring addhoc signed app: %s\n", realfilepath);
-		return;
-	}
-	
-	struct statfs fs;
-	int sfsret = statfs(realfilepath, &fs);
-	if(sfsret == 0) {
-		if(strcmp(fs.f_mntonname, "/")==0 || strcmp(fs.f_mntonname, "/Developer")==0) {
-			return;
+		int fd = open(resolvedLoadPath.fileSystemRepresentation, O_RDONLY);
+		if (fd < 0) {
+			JBLogError("Failed to open binary at path: %s (loader: %s)", resolvedLoadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation);
+			return weakDependency && errno == ENOENT ? 0 : -1;
 		}
-	}
+		if(fcntl(fd, F_GETPATH, realfilepath) != 0) {
+			JBLogError("Failed to get file path for fd %d", fd);
+			close(fd);
+			return -1;
+		}
+		struct stat openedStat = {0};
+		if (fstat(fd, &openedStat) != 0) {
+			close(fd);
+			return -1;
+		}
+
+		if(string_has_prefix(realfilepath, "/private/preboot/Cryptexes/")) {
+			JBLogDebug("Skipping Cryptexes file: %s", realfilepath);
+			close(fd);
+			return 0;
+		}
+	
+		if(isRemovableBundlePath(realfilepath) && !hasTrollstoreLiteMarker(realfilepath)) {
+			// ignore adhoc signed apps(removable system apps or other stuffs) which is not installed via tslite
+			JBLogDebug("ignoring addhoc signed app: %s\n", realfilepath);
+			close(fd);
+			return 0;
+		}
+	
+		struct statfs fs;
+		int sfsret = statfs(realfilepath, &fs);
+		if(sfsret == 0) {
+			if(strcmp(fs.f_mntonname, "/")==0 || strcmp(fs.f_mntonname, "/Developer")==0) {
+				close(fd);
+				return 0;
+			}
+		}
 
 	NSString* realLoadPath = @(realfilepath);
 
 	DEBUG_LOG("loadPath = %s, \n\tresolvedLoadPath = %s, \n\trealLoadPath = %s\n", loadPath.fileSystemRepresentation, resolvedLoadPath.fileSystemRepresentation, realLoadPath.fileSystemRepresentation);
 
-	if([fileCaches containsObject:realLoadPath]) {
-		DEBUG_LOG("Skipping already parsed file: %s", realLoadPath.fileSystemRepresentation);
-		return; // Already parsed
-	}
+		if([fileCaches containsObject:realLoadPath]) {
+			DEBUG_LOG("Skipping already parsed file: %s", realLoadPath.fileSystemRepresentation);
+			close(fd);
+			return 0; // Already parsed
+		}
 	//add realLoadPath to fileCaches
 	[fileCaches addObject:realLoadPath];
 	
-	ensure_jbroot_symlink(realLoadPath.fileSystemRepresentation);
+		ensure_jbroot_symlink(realLoadPath.fileSystemRepresentation);
 
-	Fat *fat = fat_init_from_path(realLoadPath.fileSystemRepresentation);
-	if (!fat) {
-		JBLogError("Failed to parse fat binary at path: %s", realLoadPath.fileSystemRepresentation);
-		return;
-	}
+			MemoryStream *stream = file_stream_init_from_file_descriptor(fd, 0, FILE_STREAM_SIZE_AUTO, 0);
+			if (!stream) {
+				close(fd);
+				return -1;
+			}
+			Fat *fat = fat_init_from_memory_stream(stream);
+			if (!fat) {
+				memory_stream_free(stream);
+				close(fd);
+				JBLogError("Failed to parse fat binary at path: %s", realLoadPath.fileSystemRepresentation);
+				return -1;
+			}
+			if (!recursive_path_matches_open_file(realLoadPath.fileSystemRepresentation, &openedStat)) {
+				fat_free(fat);
+				close(fd);
+				return ESTALE;
+			}
 
-	MachO *macho = NULL;
-	if ([loadPath isEqualToString:mainExecutablePath]) {
-		if (preferredArch->Count > 0) {
+		MachO *macho = NULL;
+		if ([loadPath isEqualToString:mainExecutablePath]) {
+			if (preferredArch->Count > 0) {
 			for (size_t i = 0; i < preferredArch->Count; i++) {
 				if (preferredArch->Types[i] != 0 && preferredArch->Subtypes[i] != UINT32_MAX) {
 					macho = fat_find_slice(fat, preferredArch->Types[i], preferredArch->Subtypes[i]);
 					if (macho) break;
 				}
+				}
 			}
 		}
-	}
-	if (!macho) {
-		macho = fat_find_preferred_slice(fat);
+		if (!macho && executionArch->Valid) macho = fat_find_execution_slice(fat, executionArch);
 		if (!macho) {
-			JBLogError("Failed to find preferred slice for file: %s", realLoadPath.fileSystemRepresentation);
-			fat_free(fat);
-			return;
+			macho = fat_find_preferred_slice(fat);
+				if (!macho) {
+					JBLogError("Failed to find preferred slice for file: %s", realLoadPath.fileSystemRepresentation);
+					fat_free(fat);
+					close(fd);
+					return -1;
+				}
 		}
-	}
+		if ([loadPath isEqualToString:mainExecutablePath]) {
+			executionArch->Valid = true;
+			executionArch->Type = macho->machHeader.cputype;
+			executionArch->Subtype = macho->machHeader.cpusubtype;
+		}
 
 	// Calculate cdhash and add it to our array
-	bool cdhashWasKnown = true;
-	bool isAdhocSigned = false;
-	CS_SuperBlob *superblob = macho_read_code_signature(macho);
-	if (superblob) {
-		CS_DecodedSuperBlob *decodedSuperblob = csd_superblob_decode(superblob);
-		if (decodedSuperblob) {
+		bool cdhashWasKnown = true;
+		bool isAdhocSigned = false;
+		CS_SuperBlob *superblob = macho_read_code_signature(macho);
+		if (superblob) {
+			CS_DecodedSuperBlob *decodedSuperblob = csd_superblob_decode(superblob);
+				if (!decodedSuperblob) {
+					free(superblob);
+					fat_free(fat);
+					close(fd);
+					return -1;
+				}
 			if (csd_superblob_is_adhoc_signed(decodedSuperblob)) {
 				isAdhocSigned = true;
 				cdhash_t cdhash = {0};
-				if (csd_superblob_calculate_best_cdhash(decodedSuperblob, cdhash, NULL) == 0) {
+					if (csd_superblob_calculate_best_cdhash(decodedSuperblob, cdhash, NULL) != 0) {
+						csd_superblob_free(decodedSuperblob);
+						free(superblob);
+						fat_free(fat);
+						close(fd);
+						return -1;
+					}
 					if (!cdhashesContains(cdhash)) {
 						if (!is_cdhash_trustcached(cdhash)) {
-							// If something is trustcached we do not want to add it to your array
-							// We do want to parse it's dependencies however, as one may have been updated since we added the binary to trustcache
-							// Potential optimization: If trustcached, save in some array so we don't recheck
-
-							int ret = ensure_randomized_cdhash_for_slice(realLoadPath.fileSystemRepresentation, macho->archDescriptor.offset, cdhash);
-							if(ret==0) {
-								cdhashesAdd(cdhash);
-							} else {
-								JBLogError("ensure_randomized_cdhash_for_slice(%llx) failed: %s -> (%d)", macho->archDescriptor.offset, realLoadPath.fileSystemRepresentation, ret);
+							if (!cdhashesAdd(cdhash)) {
+								csd_superblob_free(decodedSuperblob);
+								free(superblob);
+								fat_free(fat);
+								close(fd);
+								return -1;
 							}
 						}
 						cdhashWasKnown = false;
 					}
+
+					struct siginfo sigInfo = {
+						.source = SIGNATURE_SOURCE_ALLOCATION,
+						.signature = {
+							.fs_file_start = macho->archDescriptor.offset,
+							.fs_blob_start = superblob,
+							.fs_blob_size = OSSwapBigToHostInt32(superblob->length),
+						},
+					};
+					int trustResult = trust_signatures(0, fd, &sigInfo, 1);
+					if (sigInfo.source == SIGNATURE_SOURCE_ALLOCATION) free(sigInfo.signature.fs_blob_start);
+					superblob = NULL;
+					if (trustResult != 0) {
+						csd_superblob_free(decodedSuperblob);
+						fat_free(fat);
+						close(fd);
+						return trustResult;
+					}
+					if (!recursive_path_matches_open_file(realLoadPath.fileSystemRepresentation, &openedStat)) {
+						csd_superblob_free(decodedSuperblob);
+						fat_free(fat);
+						close(fd);
+						return ESTALE;
+					}
 				}
+				csd_superblob_free(decodedSuperblob);
+				free(superblob);
 			}
-			csd_superblob_free(decodedSuperblob);
+			close(fd);
+
+		if (cdhashWasKnown || // If we already knew the cdhash, we can skip parsing dependencies
+				!isAdhocSigned) { // If it was not ad hoc signed, we can safely skip it aswell
+				fat_free(fat);
+				return 0;
 		}
-		free(superblob);
-	}
 
-	if (cdhashWasKnown || // If we already knew the cdhash, we can skip parsing dependencies
-		!isAdhocSigned) { // If it was not ad hoc signed, we can safely skip it aswell
-		fat_free(fat);
-		return;
-	}
-
-	// Recurse this block on all dependencies
-	macho_enumerate_dependencies(macho, ^(const char *pathCStr, uint32_t cmd, struct dylib* dylib, bool *stop) {
+		// Recurse this block on all dependencies
+		__block int dependencyResult = 0;
+		macho_enumerate_dependencies(macho, ^(const char *pathCStr, uint32_t cmd, struct dylib* dylib, bool *stop) {
 
 		NSMutableArray* nextChain = rpathStack.mutableCopy;
 		[nextChain addObject:realLoadPath]; //Loading dependencies, add current macho itself to the rpath stack
 		
-		recurse_handler(@(pathCStr), realLoadPath, mainExecutablePath, workingDir, fileCaches, nextChain, preferredArch, cdhashesOut, cdhashCountOut);
-	});
+				int childResult = recurse_handler(@(pathCStr), realLoadPath, mainExecutablePath, workingDir, fileCaches, nextChain, preferredArch, executionArch, cmd == LC_LOAD_WEAK_DYLIB, cdhashesOut, cdhashCountOut);
+			if (childResult != 0) {
+				dependencyResult = childResult;
+				*stop = true;
+			}
+		});
 
-	fat_free(fat);
-	
+		fat_free(fat);
+		return dependencyResult;
 } //autoreleasepool
 }
 
-void recurse_collect_untrusted_cdhashes(const char *path, const char *callerImagePath, const char *callerExecutablePath, const char *workingDir, preferredArchInfo* preferredArch, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut)
+int recurse_collect_untrusted_cdhashes(const char *path, const char *callerImagePath, const char *callerExecutablePath, const char *workingDir, preferredArchInfo* preferredArch, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut)
 {
-	if(!callerExecutablePath) {
-		callerExecutablePath = path;
+		if (!path || !preferredArch || !cdhashesOut || !cdhashCountOut) return -1;
+		executionArchInfo executionArch = {0};
+		for (size_t i = 0; i < preferredArch->Count; i++) {
+			if (preferredArch->Types[i] != 0 && preferredArch->Subtypes[i] != UINT32_MAX) {
+				executionArch.Valid = true;
+				executionArch.Type = preferredArch->Types[i];
+				executionArch.Subtype = preferredArch->Subtypes[i];
+				break;
+			}
+		}
+		if(!callerExecutablePath) {
+			callerExecutablePath = path;
 	}
 
 	NSMutableArray* rpathStack = [NSMutableArray array];
@@ -314,8 +440,9 @@ void recurse_collect_untrusted_cdhashes(const char *path, const char *callerImag
 
 	NSMutableArray* fileCaches = [NSMutableArray array];
 
-	recurse_handler(@(path), @(callerImagePath), @(callerExecutablePath), workingDir ? @(workingDir) : nil, fileCaches, rpathStack, preferredArch, cdhashesOut, cdhashCountOut);
+		int result = recurse_handler(@(path), @(callerImagePath), @(callerExecutablePath), workingDir ? @(workingDir) : nil, fileCaches, rpathStack, preferredArch, &executionArch, false, cdhashesOut, cdhashCountOut);
 
-	DEBUG_LOG("fileCaches: %s", path, fileCaches.description.UTF8String);
-	DEBUG_LOG("Finished collecting cdhashes for path: %s, found %u cdhashes, processed %d files", path, *cdhashCountOut, fileCaches.count);
+		DEBUG_LOG("fileCaches: %s", path, fileCaches.description.UTF8String);
+		DEBUG_LOG("Finished collecting cdhashes for path: %s, found %u cdhashes, processed %d files", path, *cdhashCountOut, fileCaches.count);
+		return result;
 }

@@ -12,10 +12,24 @@
 #include "common/envbuf.h"
 #include "sandbox.h"
 #include "roothider.h"
+#include "dyld_dispatch.h"
+#include <libjailbreak/roothider/bootlog.h>
 
 const char* HOOK_DYLIB_PATH = NULL;
 
 bool dyld_patch_fallback_enabled = false;
+
+static void roothide_loader_trace(const char *phase, const char *path, int result)
+{
+	int savedErrno = errno;
+	const char *name = getprogname();
+	if (name && strncmp(name, "sshd", 4) == 0) {
+		char line[224];
+		snprintf(line, sizeof(line), "loader %s result=%d path=%s", phase, result, path ?: "(null)");
+		roothide_bootlog(line);
+	}
+	errno = savedErrno;
+}
 
 //export for PatchLoader
 __attribute__((visibility("default"))) int PLRequiredJIT() {
@@ -396,7 +410,8 @@ void* (*dyld_dlopen_orig)(void *dyld, const char* path, int mode);
 void* dyld_dlopen_hook(void *dyld, const char* path, int mode)
 {
 	if (path && !(mode & RTLD_NOLOAD)) {
-		jbclient_trust_library_recurse(path, __builtin_return_address(0));
+		int result = jbclient_trust_library_recurse(path, __builtin_return_address(0));
+		roothide_loader_trace("dlopen trust", path, result);
 	}
     __attribute__((musttail)) return dyld_dlopen_orig(dyld, path, mode);
 }
@@ -405,7 +420,8 @@ void* (*dyld_dlopen_from_orig)(void *dyld, const char* path, int mode, void* add
 void* dyld_dlopen_from_hook(void *dyld, const char* path, int mode, void* addressInCaller)
 {
 	if (path && !(mode & RTLD_NOLOAD)) {
-		jbclient_trust_library_recurse(path, addressInCaller);
+		int result = jbclient_trust_library_recurse(path, addressInCaller);
+		roothide_loader_trace("dlopen_from trust", path, result);
 	}
 	__attribute__((musttail)) return dyld_dlopen_from_orig(dyld, path, mode, addressInCaller);
 }
@@ -414,7 +430,8 @@ void* (*dyld_dlopen_audited_orig)(void *dyld, const char* path, int mode);
 void* dyld_dlopen_audited_hook(void *dyld, const char* path, int mode)
 {
 	if (path && !(mode & RTLD_NOLOAD)) {
-		jbclient_trust_library_recurse(path, __builtin_return_address(0));
+		int result = jbclient_trust_library_recurse(path, __builtin_return_address(0));
+		roothide_loader_trace("dlopen_audited trust", path, result);
 	}
 	__attribute__((musttail)) return dyld_dlopen_audited_orig(dyld, path, mode);
 }
@@ -423,42 +440,100 @@ bool (*dyld_dlopen_preflight_orig)(void *dyld, const char *path);
 bool dyld_dlopen_preflight_hook(void *dyld, const char* path)
 {
 	if (path) {
-		jbclient_trust_library_recurse(path, __builtin_return_address(0));
+		int result = jbclient_trust_library_recurse(path, __builtin_return_address(0));
+		roothide_loader_trace("dlopen_preflight trust", path, result);
 	}
 	__attribute__((musttail)) return dyld_dlopen_preflight_orig(dyld, path);
 }
 
 int hook_dyld_routine(void **dyld, int idx, void *hook, void **orig, uint16_t pacSalt)
 {
-	if (!dyld) return -1;
+	if (!dyld) {
+		roothide_loader_trace("missing interface", NULL, idx);
+		return -1;
+	}
 
 	uint64_t dyldPacDiversifier = ((uint64_t)dyld & ~(0xFFFFull << 48)) | (0x63FAull << 48);
 	void **dyldFuncPtrs = ptrauth_auth_data(*dyld, ptrauth_key_process_independent_data, dyldPacDiversifier);
 	if (!dyldFuncPtrs) return -1;
 
-	if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE) == 0) {
+	// Shared-cache vtables require a private copy before they can become writable.
+	kern_return_t protectionResult = vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	char slot[32];
+	snprintf(slot, sizeof(slot), "slot=%d", idx);
+	roothide_loader_trace("vtable writable", slot, protectionResult);
+	if (protectionResult == 0) {
 		uint64_t location = (uint64_t)&dyldFuncPtrs[idx];
 		uint64_t pacDiversifier = (location & ~(0xFFFFull << 48)) | ((uint64_t)pacSalt << 48);
+		void *oldDyldTarget = dyldFuncPtrs[idx];
 
-		*orig = ptrauth_auth_and_resign(dyldFuncPtrs[idx], ptrauth_key_process_independent_code, pacDiversifier, ptrauth_key_function_pointer, 0);
+		*orig = ptrauth_auth_and_resign(oldDyldTarget, ptrauth_key_process_independent_code, pacDiversifier, ptrauth_key_function_pointer, 0);
 		dyldFuncPtrs[idx] = ptrauth_auth_and_resign(hook, ptrauth_key_function_pointer, 0, ptrauth_key_process_independent_code, pacDiversifier);
-		vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ);
-		return 0;
+		protectionResult = vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ);
+		roothide_loader_trace("vtable restored", slot, protectionResult);
+		if (protectionResult == 0) return 0;
+
+		// Keep failure atomic: restore the original signed entry before returning.
+		dyldFuncPtrs[idx] = oldDyldTarget;
+		protectionResult = vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_COPY);
+		roothide_loader_trace("vtable rollback", slot, protectionResult);
+		return -1;
 	}
 
 	return -1;
 }
 
-void init_dyldhooks()
+int init_dyldhooks()
 {
+	int result = -1;
+	int hookResult = 0;
+
 	// Apply dyld hooks
 	void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
+	roothide_loader_trace("interface lookup", "gDyld", gDyldPtr != NULL);
 	if (gDyldPtr) {
-		hook_dyld_routine(*gDyldPtr, 14, (void *)&dyld_dlopen_hook, (void **)&dyld_dlopen_orig, 0xBF31);
-		hook_dyld_routine(*gDyldPtr, 18, (void *)&dyld_dlopen_preflight_hook, (void **)&dyld_dlopen_preflight_orig, 0xB1B6);
-		hook_dyld_routine(*gDyldPtr, 97, (void *)&dyld_dlopen_from_hook, (void **)&dyld_dlopen_from_orig, 0xD48C);
-		hook_dyld_routine(*gDyldPtr, 98, (void *)&dyld_dlopen_audited_hook, (void **)&dyld_dlopen_audited_orig, 0xD2A5);
+		result = 0;
+		hookResult = hook_dyld_routine(*gDyldPtr, 14, (void *)&dyld_dlopen_hook, (void **)&dyld_dlopen_orig, 0xBF31);
+		if (hookResult != 0 && result == 0) result = hookResult;
+		hookResult = hook_dyld_routine(*gDyldPtr, 18, (void *)&dyld_dlopen_preflight_hook, (void **)&dyld_dlopen_preflight_orig, 0xB1B6);
+		if (hookResult != 0 && result == 0) result = hookResult;
+		hookResult = hook_dyld_routine(*gDyldPtr, 97, (void *)&dyld_dlopen_from_hook, (void **)&dyld_dlopen_from_orig, 0xD48C);
+		if (hookResult != 0 && result == 0) result = hookResult;
+		hookResult = hook_dyld_routine(*gDyldPtr, 98, (void *)&dyld_dlopen_audited_hook, (void **)&dyld_dlopen_audited_orig, 0xD2A5);
+		if (hookResult != 0 && result == 0) result = hookResult;
+	} else {
+		void ***gAPIsPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gAPIsE");
+		roothide_loader_trace("interface lookup", "gAPIs", gAPIsPtr != NULL);
+		if (gAPIsPtr) {
+			result = 0;
+		#ifdef __arm64e__
+			hookResult = dyld_hook_dispatch(gAPIsPtr, "_dlopen", 2, 13, (void *)&dyld_dlopen_hook, (void **)&dyld_dlopen_orig, 0xBF31);
+			roothide_loader_trace("dispatch hook", "dlopen", hookResult);
+			if (hookResult != 0 && result == 0) result = hookResult;
+			hookResult = dyld_hook_dispatch(gAPIsPtr, "_dlopen_preflight", 1, 17, (void *)&dyld_dlopen_preflight_hook, (void **)&dyld_dlopen_preflight_orig, 0xB1B6);
+			roothide_loader_trace("dispatch hook", "dlopen_preflight", hookResult);
+			if (hookResult != 0 && result == 0) result = hookResult;
+			hookResult = dyld_hook_dispatch(gAPIsPtr, "_dlopen_from", 3, 92, (void *)&dyld_dlopen_from_hook, (void **)&dyld_dlopen_from_orig, 0xD48C);
+			roothide_loader_trace("dispatch hook", "dlopen_from", hookResult);
+			if (hookResult != 0 && result == 0) result = hookResult;
+			hookResult = dyld_hook_dispatch(gAPIsPtr, "_dlopen_audited", 2, 93, (void *)&dyld_dlopen_audited_hook, (void **)&dyld_dlopen_audited_orig, 0xD2A5);
+			roothide_loader_trace("dispatch hook", "dlopen_audited", hookResult);
+			if (hookResult != 0 && result == 0) result = hookResult;
+		#else
+			// gAPIs removed additional entries before dlopen_from; the shift is not uniform.
+			hookResult = hook_dyld_routine(*gAPIsPtr, 13, (void *)&dyld_dlopen_hook, (void **)&dyld_dlopen_orig, 0xBF31);
+			if (hookResult != 0 && result == 0) result = hookResult;
+			hookResult = hook_dyld_routine(*gAPIsPtr, 17, (void *)&dyld_dlopen_preflight_hook, (void **)&dyld_dlopen_preflight_orig, 0xB1B6);
+			if (hookResult != 0 && result == 0) result = hookResult;
+			hookResult = hook_dyld_routine(*gAPIsPtr, 92, (void *)&dyld_dlopen_from_hook, (void **)&dyld_dlopen_from_orig, 0xD48C);
+			if (hookResult != 0 && result == 0) result = hookResult;
+			hookResult = hook_dyld_routine(*gAPIsPtr, 93, (void *)&dyld_dlopen_audited_hook, (void **)&dyld_dlopen_audited_orig, 0xD2A5);
+			if (hookResult != 0 && result == 0) result = hookResult;
+		#endif
+		}
 	}
+
+	return result;
 }
 
 extern struct mach_header __dso_handle;
@@ -468,6 +543,7 @@ extern int parse_dyldhook_jbinfo(char **jbRootPathOut, char **bootUUIDOut, char 
 
 void roothide_init()
 {
+	roothide_loader_trace("systemhook entered", NULL, 0);
 	if(getenv("DYLD_INSERT_LIBRARIES")) {
 		const char* DYLD_IN_CACHE = getenv("DYLD_IN_CACHE");
 		if(DYLD_IN_CACHE && strcmp(DYLD_IN_CACHE, "0") == 0) {
@@ -477,7 +553,9 @@ void roothide_init()
 
 	HOOK_DYLIB_PATH = strdup(dyld_image_path_containing_address(&__dso_handle));
 
-	if(parse_dyldhook_jbinfo(NULL, NULL, NULL, NULL) != 0)
+	int loaderState = parse_dyldhook_jbinfo(NULL, NULL, NULL, NULL);
+	roothide_loader_trace("dyld checkin state", HOOK_DYLIB_PATH, loaderState);
+	if(loaderState != 0)
 	{
 		dyld_patch_fallback_enabled = true;
 	}
@@ -485,9 +563,14 @@ void roothide_init()
 
 void roothide_init_with_checkin(const char* rootdir)
 {
+	roothide_loader_trace("checkin completed", rootdir, dyld_patch_fallback_enabled);
 	if(dyld_patch_fallback_enabled)
 	{
-		init_dyldhooks();
+		int result = init_dyldhooks();
+		if (result != 0) {
+			roothide_loader_trace("loader hook initialization failed", rootdir, result);
+			return;
+		}
 	}
 
 	redirect_paths(rootdir);

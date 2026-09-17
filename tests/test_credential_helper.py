@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import unittest
 
+from port_review_test_support import function_source
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "BaseBin/libjailbreak/src/util.c"
@@ -13,7 +15,7 @@ class CredentialHelperTests(unittest.TestCase):
     def test_persona_client_does_not_resume_after_failure(self):
         source = (ROOT / "BaseBin/systemhook/src/common/common.c").read_text()
         start = source.index("if (r == 0 && childPid > 0 && (personaFixUid == 0 || personaFixGid == 0))")
-        end = source.index("\n}\n", start)
+        end = source.index("\ncleanup:", start)
         harness = r'''
 #include <assert.h>
 #include <errno.h>
@@ -41,6 +43,7 @@ static pid_t reap(pid_t pid, int *status, int flags) {
 static int finish(int r, bool personaFixNeedsResume) {
     int childPid = 42, personaFixUid = 0, personaFixGid = 0;
 BODY
+    return r;
 }
 int main(void) {
     rpc = -1;
@@ -64,7 +67,8 @@ int main(void) {
 
     def test_donor_does_not_acknowledge_failed_identity_changes(self):
         source = (ROOT / "BaseBin/dyldhook/src/main.c").read_text()
-        body = source.split("if (fd == -1) return;", 1)[1].split('__asm("b .");', 1)[0]
+        body = "int credentialResult =" + source.split("int credentialResult =", 1)[1].split('__asm("b .");', 1)[0]
+        operation_count = len(re.findall(r"(?:credentialResult =|credentialResult \|=) set", body))
         harness = r'''
 #include <assert.h>
 #include <sys/types.h>
@@ -84,17 +88,16 @@ static ssize_t record(int fd, const void *data, size_t size) {
 #define write record
 static void donor(void) {
     int fd = 3;
-    gid_t groups[NGROUPS_MAX] = {0};
 BODY
 }
 int main(void) {
-    for (failing = 0; failing <= 7; failing++) {
+    for (failing = 0; failing <= OPERATION_COUNT; failing++) {
         call = 0; marker = 0;
         donor();
         assert((marker == 0x42) == (failing == 0));
     }
 }
-'''.replace("BODY", body)
+'''.replace("BODY", body).replace("OPERATION_COUNT", str(operation_count))
         with tempfile.TemporaryDirectory(prefix="wolf-donor-") as directory:
             root = pathlib.Path(directory)
             file = root / "donor.c"
@@ -106,12 +109,10 @@ int main(void) {
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_preparation_reply_and_failure_cleanup(self):
-        source = SOURCE.read_text()
-        start = source.index("int target_proc_with_ucred(")
-        end = source.index("\nint proc_ucred_update_content(", start)
+        source = function_source("BaseBin/libjailbreak/src/util.c", "target_proc_with_ucred_counted")
         with tempfile.TemporaryDirectory(prefix="wolf-credential-") as directory:
             root = pathlib.Path(directory)
-            (root / "helper-under-test.h").write_text(source[start:end])
+            (root / "helper-under-test.h").write_text(source)
             executable = root / "credential_helper_tests"
             result = subprocess.run(
                 [
@@ -137,7 +138,7 @@ int main(void) {
 
     def test_both_credential_callers_propagate_failure(self):
         source = (ROOT / "BaseBin/launchdhook/src/jbserver/jbdomain_systemwide.c").read_text()
-        calls = re.findall(r"if\s*\(proc_ucred_update_content\([^;]+?\)\s*!=\s*0\)\s*(?:\{\s*)?return -1;", source)
+        calls = re.findall(r"if\s*\(proc_ucred_update_content_counted\([^;]+?\)\s*!=\s*0\)\s*(?:\{\s*)?return -1;", source)
         self.assertEqual(len(calls), 2)
 
 

@@ -56,33 +56,42 @@ int apply_dyld_patch(NSString *dyldPath, const char *newUUIDPrefix)
 	};
 
 	if (getAMFIAddr == 0) {
-        printf("Error: Failed patchfinding getAMFI\n");
-        return -1;
-    }
+	        printf("Error: Failed patchfinding getAMFI\n");
+		macho_free(dyldMacho);
+	        return -1;
+	    }
 
-	macho_write_at_vmaddr(dyldMacho, getAMFIAddr, sizeof(getAMFIPatch), getAMFIPatch);
+	if (macho_write_at_vmaddr(dyldMacho, getAMFIAddr, sizeof(getAMFIPatch), getAMFIPatch) != 0) {
+		macho_free(dyldMacho);
+		return -1;
+	}
 
 	// iOS 16+: Change LC_UUID to prevent the kernel from using the in-cache dyld
+	__block bool foundUUID = false;
 	macho_enumerate_load_commands(dyldMacho, ^(struct load_command loadCommand, uint64_t offset, void *cmd, bool *stop) {
-		if (loadCommand.cmd == LC_UUID) {
+			if (loadCommand.cmd == LC_UUID) {
+				foundUUID = true;
             // The new UUID will look like this:
             // DOPA<dopamine version>\0<rest of original UUID>
             // This way we ensure:
             // - The version it was patched on and it being patched by Dopamine is identifiable later
             // - The UUID is still unique based on the source dyld that was patched
 
-            size_t newUUIDPrefixLen = strlen(newUUIDPrefix) + 1;
-            if (newUUIDPrefixLen <= sizeof(uuid_t)) {
-                // Also write null byte here, because otherwise it's impossible to know where the version string ends
-                macho_write_at_offset(dyldMacho, offset + offsetof(struct uuid_command, uuid), newUUIDPrefixLen, newUUIDPrefix);
-            }
+	            size_t newUUIDPrefixLen = strlen(newUUIDPrefix) + 1;
+	            if (newUUIDPrefixLen <= sizeof(uuid_t)) {
+	                // Also write null byte here, because otherwise it's impossible to know where the version string ends
+	                if (macho_write_at_offset(dyldMacho, offset + offsetof(struct uuid_command, uuid), newUUIDPrefixLen, newUUIDPrefix) != 0) {
+					r = -1;
+				}
+	            }
             else {
 				r = -1;
                 printf("Error: Failed to write identifier to LC_UUID, too long (%zu)\n", newUUIDPrefixLen);
             }
 			*stop = true;
-		}
-	});
+			}
+		});
+	if (!foundUUID) r = -1;
 
 	macho_free(dyldMacho);
 	return r;
@@ -129,32 +138,34 @@ int basebin_generate_internal(NSString *originUsrLibPath, NSString *basebinPath,
 	NSString *dopamineVersion = [NSString stringWithContentsOfFile:versionPath encoding:NSUTF8StringEncoding error:nil];
 	if (!dopamineVersion) return 1;
 
-	[[NSFileManager defaultManager] createDirectoryAtPath:genPath withIntermediateDirectories:YES attributes:nil error:nil];
+		if (![[NSFileManager defaultManager] createDirectoryAtPath:genPath withIntermediateDirectories:YES attributes:nil error:nil]) return 5;
 	roothide_bootlog("generator: generation directory prepared");
 
 	if (!comingFromJBUpdate) {
 		// Copy /usr/lib to /var/jb/basebin/.fakelib
-		[[NSFileManager defaultManager] removeItemAtPath:fakelibPath error:nil];
-		[[NSFileManager defaultManager] createDirectoryAtPath:fakelibPath withIntermediateDirectories:YES attributes:nil error:nil];
-		roothide_bootlog("generator: copying system libraries");
-		carbonCopy(originUsrLibPath, fakelibPath);
+			if ([[NSFileManager defaultManager] fileExistsAtPath:fakelibPath] &&
+				![[NSFileManager defaultManager] removeItemAtPath:fakelibPath error:nil]) return 6;
+			if (![[NSFileManager defaultManager] createDirectoryAtPath:fakelibPath withIntermediateDirectories:YES attributes:nil error:nil]) return 7;
+			roothide_bootlog("generator: copying system libraries");
+			if (carbonCopy(originUsrLibPath, fakelibPath) != 0) return 8;
 		roothide_bootlog("generator: system libraries copied");
 
 		// Delete the dyld inside .fakelib
-		[[NSFileManager defaultManager] removeItemAtPath:fakelibDyldPath error:nil];
+			if ([[NSFileManager defaultManager] fileExistsAtPath:fakelibDyldPath] &&
+				![[NSFileManager defaultManager] removeItemAtPath:fakelibDyldPath error:nil]) return 9;
 
 		// Symlink .fakelib/dyld -> /var/jb/basebin/gen/dyld
-		[[NSFileManager defaultManager] createSymbolicLinkAtPath:fakelibDyldPath withDestinationPath:targetDyldPath error:nil];
+			if (![[NSFileManager defaultManager] createSymbolicLinkAtPath:fakelibDyldPath withDestinationPath:targetDyldPath error:nil]) return 10;
 
 		// Symlink .fakelib/systemhook.dylib -> /var/jb/basebin/systemhook.dylib
-		[[NSFileManager defaultManager] createSymbolicLinkAtPath:fakelibSystemHookPath withDestinationPath:targetSystemhookPath error:nil];
+			if (![[NSFileManager defaultManager] createSymbolicLinkAtPath:fakelibSystemHookPath withDestinationPath:targetSystemhookPath error:nil]) return 11;
 
 		// Backup original dyld
-		carbonCopy(dyldPath, dyldOrigPath);
+			if (carbonCopy(dyldPath, dyldOrigPath) != 0) return 12;
 		roothide_bootlog("generator: original linker copied");
 	}
 
-	carbonCopy(dyldOrigPath, dyldInflightPath);
+		if (carbonCopy(dyldOrigPath, dyldInflightPath) != 0) return 13;
 	roothide_bootlog("generator: inflight linker copied");
 
 	NSString *dyldUUIDPrefix = [@"DOPA" stringByAppendingString:dopamineVersion];
@@ -171,13 +182,13 @@ int basebin_generate_internal(NSString *originUsrLibPath, NSString *basebinPath,
 		// So we will move the past patched dyld to dyld.old to keep the vnode alive
 		// If there is another dyld.old at this point, we will remove it now
 		// since it is guaranteed to not be in use at this point
-		if ([[NSFileManager defaultManager] fileExistsAtPath:dyldOldPath]) {
-			[[NSFileManager defaultManager] removeItemAtPath:dyldOldPath error:nil];
+			if ([[NSFileManager defaultManager] fileExistsAtPath:dyldOldPath]) {
+				if (![[NSFileManager defaultManager] removeItemAtPath:dyldOldPath error:nil]) return 14;
+			}
+			if (![[NSFileManager defaultManager] moveItemAtPath:dyldPatchedPath toPath:dyldOldPath error:nil]) return 15;
 		}
-		[[NSFileManager defaultManager] moveItemAtPath:dyldPatchedPath toPath:dyldOldPath error:nil];
-	}
 
-	[[NSFileManager defaultManager] moveItemAtPath:dyldInflightPath toPath:dyldPatchedPath error:nil];
+		if (![[NSFileManager defaultManager] moveItemAtPath:dyldInflightPath toPath:dyldPatchedPath error:nil]) return 16;
 	roothide_bootlog("generator: linker published");
 	return 0;
 }

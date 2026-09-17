@@ -135,7 +135,7 @@ int main(void)
         for (unsigned i = 0; i < NGROUPS_MAX; i++) groups[i] = (gid_t)-1;
         groups[0] = 501;
         uint64_t start = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        int result = target_proc_with_ucred("/fixture/target", 501, 501, 501, 501, groups);
+        int result = target_proc_with_ucred_counted("/fixture/target", 501, 501, 501, 501, groups, 1);
         if (scenario == GOOD) {
             assert(result == 4242);
             assert(patchCount == 1 && resumeCount == 1 && killCount == 0);

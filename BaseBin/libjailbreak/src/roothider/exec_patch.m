@@ -20,8 +20,21 @@ void event_handler(int kq)
     {
         struct kevent event = {0};
         int ret = kevent(kq, NULL, 0, &event, 1, NULL);
-        assert(ret == 1);
-        assert(event.filter == EVFILT_PROC);
+        if (ret < 0) {
+            if (errno != EINTR) {
+                JBLogError("[execPatch] kevent failed: %d, %s", errno, strerror(errno));
+                usleep(10 * 1000);
+            }
+            continue;
+        }
+        if (ret != 1) {
+            JBLogError("[execPatch] unexpected kevent result: %d", ret);
+            continue;
+        }
+        if (event.filter != EVFILT_PROC) {
+            JBLogError("[execPatch] unexpected kevent filter: %d", event.filter);
+            continue;
+        }
 
         pid_t pid = (pid_t)event.ident;
 

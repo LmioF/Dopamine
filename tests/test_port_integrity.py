@@ -36,7 +36,6 @@ class PortIntegrityTests(unittest.TestCase):
 
     def test_upstream_kernel_compatibility_is_preserved(self):
         paths = (
-            "BaseBin/libjailbreak/src/info.c",
             "BaseBin/libjailbreak/src/kernel.c",
             "BaseBin/libjailbreak/src/kernel.h",
             "BaseBin/libjailbreak/src/translation.c",
@@ -46,6 +45,15 @@ class PortIntegrityTests(unittest.TestCase):
         for path in paths:
             with self.subTest(path=path):
                 self.assertEqual((ROOT / path).read_bytes(), git("show", f"{UPSTREAM_REVISION}:{path}"))
+
+        # RootHide's counted credential repair needs the cr_ngroups offset, which
+        # sits between the upstream uid/svuid and groups fields.  Keep the rest
+        # of info.c byte-for-byte upstream while admitting only that adaptation.
+        path = "BaseBin/libjailbreak/src/info.c"
+        current = (ROOT / path).read_text()
+        adaptation = "\tgSystemInfo.kernelStruct.ucred.ngroups = ucred_cr_posix + 0xC;\n"
+        self.assertEqual(current.count(adaptation), 1)
+        self.assertEqual(current.replace(adaptation, ""), git("show", f"{UPSTREAM_REVISION}:{path}").decode())
 
     def test_upstream_serialized_fields_are_preserved(self):
         path = "BaseBin/libjailbreak/src/info.h"

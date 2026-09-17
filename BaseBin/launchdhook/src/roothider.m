@@ -50,7 +50,7 @@ int new_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in addr_in = *(struct sockaddr_in*)addr;
-        in_port_t port = ntohs(addr_in.sin_port);
+        unsigned int port = ntohs(addr_in.sin_port);
         if (port == 0) {
 			int ret = -1;
 			for(port=IPPORT_HIFIRSTAUTO; port<=IPPORT_HILASTAUTO; port++)
@@ -65,7 +65,7 @@ int new_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
         }
     } else if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
         struct sockaddr_in6 addr_in6 = *(struct sockaddr_in6*)addr;
-        in_port_t port = ntohs(addr_in6.sin6_port);
+        unsigned int port = ntohs(addr_in6.sin6_port);
         if (port == 0) {
 			int ret = -1;
 			for(port=IPPORT_HIFIRSTAUTO; port<=IPPORT_HILASTAUTO; port++)

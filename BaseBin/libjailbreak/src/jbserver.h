@@ -28,6 +28,7 @@ typedef struct s_jbserver_arg
 	const char *name;
 	jbserver_type type;
 	bool out;
+	bool optional;
 } jbserver_arg;
 
 struct jbserver_action {
@@ -76,7 +77,8 @@ struct jbserver_mach_msg_checkin_reply {
 	bool forceCSAdhoc;
 	char jbRootPath[PATH_MAX];
 	char bootUUID[37];
-	char sandboxExtensions[2000];
+#define JBSERVER_SANDBOX_EXTENSIONS_MAX 2000
+	char sandboxExtensions[JBSERVER_SANDBOX_EXTENSIONS_MAX];
 };
 
 struct jbserver_mach_msg_forkfix {

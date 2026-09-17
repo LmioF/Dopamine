@@ -7,6 +7,8 @@
 #import <Foundation/Foundation.h>
 #import <CoreServices/LSApplicationProxy.h>
 #import <CoreServices/LSApplicationWorkspace.h>
+#include <errno.h>
+#include <limits.h>
 
 int reboot3(uint64_t flags, ...);
 #define RB2_USERREBOOT (0x2000000000000000llu)
@@ -21,6 +23,20 @@ Available commands:\n\
 	trustcache clear\t\tClears all existing cdhashes from the jailbreaks trustcache\n\
 	trustcache add /path/to/macho\t\tAdd the cdhash of a Mach-O file to the jailbreak trustcache\n\
 	update <tipa/basebin/tarball> <path>\tUpdates the jailbreak and reboots userspace; TIPA installation requires TrollStore\n");
+}
+
+static int wait_for_parent(int fd)
+{
+	char marker = 0;
+	ssize_t received;
+	do {
+		received = read(fd, &marker, sizeof(marker));
+	} while (received < 0 && errno == EINTR);
+	int result = 0;
+	if (received < 0) result = errno;
+	else if (received != 1 || marker != 'w') result = received == 0 ? EPIPE : EPROTO;
+	close(fd);
+	return result;
 }
 
 int main(int argc, char* argv[])
@@ -53,12 +69,16 @@ int main(int argc, char* argv[])
 
 	if (argc > 2) {
 		if (!strcmp(argv[argc-2], "--waitfor")) {
-			// When the Dopamine app spawns jbctl it needs to clean up it's own ucred before jbctl does the requested action
-			// For this it will attach a pipe fd and write to it once the cleanup is done, so we need to wait until that write happens
-			int fd = atoi(argv[argc-1]);
-			int r = 0;
-			read(fd, &r, sizeof(r));
-			close(fd);
+			if (argc < 4) return EINVAL;
+			// The parent must finish dropping its temporary credentials before any requested action.
+			char *end = NULL;
+			errno = 0;
+			long fd = strtol(argv[argc-1], &end, 10);
+			if (errno || !argv[argc-1][0] || *end || fd < 0 || fd > INT_MAX) return EINVAL;
+			int result = wait_for_parent((int)fd);
+			if (result) return result;
+			argc -= 2;
+			argv[argc] = NULL;
 		}
 	}
 

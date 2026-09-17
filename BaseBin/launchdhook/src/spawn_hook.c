@@ -106,9 +106,7 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 			// Mainly so we don't lock up while spawning boomerang
 			gInEarlyBoot = true;
 
-			hookd_provider_teardown();
-
-			// If the jailbreak is currently hidden, fakelib is not mounted
+				// If the jailbreak is currently hidden, fakelib is not mounted
 			// It needs to be mounted to regain launchd code execution after the userspace reboot
 //			ensure_fakelib_mounted();
 
@@ -119,7 +117,13 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 #endif
 
 			// Before the userspace reboot, we want to stash the primitives into boomerang
-			boomerang_stashPrimitives();
+				int stashResult = boomerang_stashPrimitives();
+				if (stashResult != 0) {
+					gInEarlyBoot = false;
+					return stashResult;
+				}
+
+				hookd_provider_teardown();
 
 			// Fix Xcode debugging being broken after the userspace reboot
 			unmount("/Developer", MNT_FORCE);

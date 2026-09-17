@@ -39,7 +39,7 @@ bool macho_is_mappable(MachO *macho)
 
 	cpu_type_t cputype = header->cputype;
 	cpu_subtype_t cpusubtype = header->cpusubtype;
-	bool isLibrary = (header->filetype == MH_EXECUTE);
+	bool isLibrary = (header->filetype != MH_EXECUTE);
 
 	if (cputype != CPU_TYPE_ARM64) return false;
 
@@ -349,31 +349,33 @@ int trust_signatures(int pid, int fd, struct siginfo *sigInfos, uint32_t sigInfo
 								// Neither: We give it CS_ADHOC
 								// Both: We strip CS_ADHOC
 
-								if (curSigInfo->source == SIGNATURE_SOURCE_ALLOCATION) {
 									if (hasTeamId) {
-										// Has both TeamID and CS_ADHOC, strip CS_ADHOC
+										// Has both TeamID and CS_ADHOC, strip CS_ADHOC.
 										csd_code_directory_set_flags(bestCDBlob, flags & ~CS_ADHOC);
 									}
 									else {
-										// Has neither TeamID or CS_ADHOC, add CS_ADHOC
+										// Has neither TeamID nor CS_ADHOC, add CS_ADHOC.
 										csd_code_directory_set_flags(bestCDBlob, flags | CS_ADHOC);
 									}
 
-									free(curSigInfo->signature.fs_blob_start);
-									superblob = csd_superblob_encode(decodedSuperblob);
-									curSigInfo->signature.fs_blob_start = superblob;
-									curSigInfo->signature.fs_blob_size = OSSwapBigToHostInt32(superblob->length);
+									// Normalization is performed on our decoded copy, so file- and
+									// process-backed inputs can be materialized into owned bytes before
+									// the server attaches the normalized signature to the open file.
+									CS_SuperBlob *normalizedSuperblob = csd_superblob_encode(decodedSuperblob);
+									if (!normalizedSuperblob) {
+										csd_superblob_free(decodedSuperblob);
+										free(cdhashes);
+										free(sigInfosToAttach);
+										return -1;
+									}
+									if (curSigInfo->source == SIGNATURE_SOURCE_ALLOCATION) {
+										free(curSigInfo->signature.fs_blob_start);
+									}
+									curSigInfo->source = SIGNATURE_SOURCE_ALLOCATION;
+									curSigInfo->signature.fs_blob_start = normalizedSuperblob;
+									curSigInfo->signature.fs_blob_size = OSSwapBigToHostInt32(normalizedSuperblob->length);
 
 									needsAttach = true;
-								}
-								else {
-									// If the signature does not reside inside our own address space, there is nothing we can do
-									// Such a signature should have been caught by dyldhook so in reality this code path will probably never fire
-									csd_superblob_free(decodedSuperblob);
-									free(cdhashes);
-									free(sigInfosToAttach);
-									return -1;
-								}
 							}
 						}
 
@@ -390,9 +392,14 @@ int trust_signatures(int pid, int fd, struct siginfo *sigInfos, uint32_t sigInfo
 		}
 	}
 
-	if (cdhashesCount > 0) {
-		jb_trustcache_add_cdhashes(cdhashes, cdhashesCount);
-	}
+		if (cdhashesCount > 0) {
+			int tc_r = jb_trustcache_add_cdhashes(cdhashes, cdhashesCount);
+			if (tc_r != 0) {
+				free(sigInfosToAttach);
+				free(cdhashes);
+				return tc_r;
+			}
+		}
 
 	int r = 0;
 	if (sigInfosToAttachCount > 0) {

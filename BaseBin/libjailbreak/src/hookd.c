@@ -4,41 +4,48 @@
 #include <spawn.h>
 #include <xpc_private.h>
 #include "inline_svc.h"
+#include <limits.h>
 
 #include "jbclient_mach.h"
 int (*hookd_send_msg)(struct hookd_mach_msg *msg, struct hookd_mach_msg_reply *reply) = jbclient_mach_hookd_send_msg;
 
 size_t hookd_sizeof_encoded_hook(struct hookd_hook *hook)
 {
-	return sizeof(struct hookd_encoded_hook) + hook->dataSize;;
+	if (!hook || !hook->data || !hook->dataSize ||
+		hook->dataSize > HOOKD_MSG_MAX_SIZE - sizeof(struct hookd_encoded_hook)) return 0;
+	return sizeof(struct hookd_encoded_hook) + hook->dataSize;
 }
 
-int hook_encode_hook(struct hookd_encoded_hook *encodedHook, struct hookd_hook *hook)
+int hook_encode_hook(void *encodedHook, struct hookd_hook *hook)
 {
-	encodedHook->address = hook->address;
-	encodedHook->dataSize = hook->dataSize;
-	memcpy(&encodedHook->data[0], hook->data, hook->dataSize);
+	if (!encodedHook || !hookd_sizeof_encoded_hook(hook)) return -1;
+	struct hookd_encoded_hook header = {
+		.address = hook->address,
+		.dataSize = hook->dataSize,
+	};
+	memcpy(encodedHook, &header, sizeof(header));
+	memcpy((uint8_t *)encodedHook + sizeof(header), hook->data, hook->dataSize);
 	return 0;
 }
 
 int hookd_encode_msg(struct hookd_mach_msg *msg, int clientPid, task_port_t taskPort, struct hookd_hook *hooks, int hooksCount, struct hookd_encoded_fixup *fixups, int fixupsCount)
 {
-	if (!msg) return -1;
-
-	size_t msgSize = sizeof(struct hookd_mach_msg);
+	if (!msg || hooksCount < 0 || fixupsCount < 0 ||
+		(hooksCount && !hooks) || (fixupsCount && !fixups)) return -1;
+	size_t payloadCapacity = HOOKD_MSG_MAX_SIZE - sizeof(*msg);
+	if ((size_t)hooksCount > payloadCapacity / sizeof(struct hookd_encoded_hook) ||
+		(size_t)fixupsCount > payloadCapacity / sizeof(struct hookd_encoded_fixup)) return -1;
+	size_t fixupsSize = sizeof(struct hookd_encoded_fixup) * (size_t)fixupsCount;
+	size_t remaining = payloadCapacity - fixupsSize;
 
 	size_t hooksSize = 0;
 	for (int i = 0; i < hooksCount; i++) {
-		hooksSize += hookd_sizeof_encoded_hook(&hooks[i]);
+		size_t hookSize = hookd_sizeof_encoded_hook(&hooks[i]);
+		if (!hookSize || hookSize > remaining) return -1;
+		hooksSize += hookSize;
+		remaining -= hookSize;
 	}
-	msgSize += hooksSize;
-
-	size_t fixupsSize = sizeof(struct hookd_encoded_fixup) * fixupsCount;
-	msgSize += fixupsSize;
-
-	if (msgSize > HOOKD_MSG_MAX_SIZE) return -1;
-
-	msg->hdr.msgh_size = msgSize;
+	msg->hdr.msgh_size = (mach_msg_size_t)(sizeof(*msg) + hooksSize + fixupsSize);
 
 	msg->clientPid = clientPid;
 	msg->taskPortInClient = taskPort == mach_task_self() ? -1 : taskPort;
@@ -46,32 +53,41 @@ int hookd_encode_msg(struct hookd_mach_msg *msg, int clientPid, task_port_t task
 	msg->hooksStartOff  = 0;
 	msg->fixupsStartOff = hooksSize;
 
-	uint64_t off = msg->hooksStartOff;
-	for (int i = 0; i < hooksCount && off < msg->fixupsStartOff; i++) {
+	size_t off = 0;
+	for (int i = 0; i < hooksCount; i++) {
 		size_t hookSize = hookd_sizeof_encoded_hook(&hooks[i]);
-		hook_encode_hook((struct hookd_encoded_hook *)&msg->data[off], &hooks[i]);
+		hook_encode_hook(&msg->data[off], &hooks[i]);
 		off += hookSize;
 	}
 
-	memcpy(&msg->data[msg->fixupsStartOff], fixups, fixupsCount * sizeof(struct hookd_encoded_fixup));
+	if (fixupsSize) memcpy(&msg->data[msg->fixupsStartOff], fixups, fixupsSize);
 
 	return 0;
 }
 
-int hookd_decode_reply(struct hookd_mach_msg_reply *reply, int *hookResultsOut, int *fixupResultsOut)
+static int hookd_decode_reply(struct hookd_mach_msg_reply *reply, int hooksCount, int *hookResultsOut, int fixupsCount, int *fixupResultsOut)
 {
-	if (reply->hdr.msgh_size < sizeof(struct hookd_mach_msg_reply)) return -1;
-	if (reply->hdr.msgh_size != (sizeof(struct hookd_mach_msg_reply) + reply->hookResultsCount * sizeof(int64_t) + reply->fixupResultsCount * sizeof(int64_t))) return -1;
-
-	int64_t *hookResults  = (int64_t *)&reply->data[0];
-	int64_t *fixupResults = (int64_t *)&reply->data[reply->hookResultsCount * sizeof(int64_t)];
-
-	for (int i = 0; i < reply->hookResultsCount; i++) {
-		hookResultsOut[i] = (int)hookResults[i];
+	if (!reply || hooksCount < 0 || fixupsCount < 0 ||
+		(hooksCount && !hookResultsOut) || (fixupsCount && !fixupResultsOut)) return -1;
+	size_t replySize = reply->hdr.msgh_size;
+	if (replySize < sizeof(*reply) || replySize > HOOKD_MSG_MAX_SIZE) return -1;
+	size_t resultCapacity = (replySize - sizeof(*reply)) / sizeof(int64_t);
+	if ((size_t)hooksCount > resultCapacity ||
+		(size_t)fixupsCount > resultCapacity - (size_t)hooksCount) return -1;
+	if (reply->hookResultsCount != (uint64_t)hooksCount ||
+		reply->fixupResultsCount != (uint64_t)fixupsCount) return -1;
+	size_t resultCount = (size_t)hooksCount + (size_t)fixupsCount;
+	if (replySize != sizeof(*reply) + resultCount * sizeof(int64_t)) return -1;
+	for (size_t i = 0; i < resultCount; i++) {
+		int64_t result;
+		memcpy(&result, &reply->data[i * sizeof(result)], sizeof(result));
+		if (result < INT_MIN || result > INT_MAX) return -1;
 	}
-
-	for (int i = 0; i < reply->fixupResultsCount; i++) {
-		fixupResultsOut[i] = (int)fixupResults[i];
+	for (size_t i = 0; i < resultCount; i++) {
+		int64_t result;
+		memcpy(&result, &reply->data[i * sizeof(result)], sizeof(result));
+		if (i < (size_t)hooksCount) hookResultsOut[i] = (int)result;
+		else fixupResultsOut[i - (size_t)hooksCount] = (int)result;
 	}
 
 	return 0;
@@ -79,24 +95,25 @@ int hookd_decode_reply(struct hookd_mach_msg_reply *reply, int *hookResultsOut, 
 
 int hookd_send_requests(task_port_t taskPort, struct hookd_hook *hooks, int hooksCount, int *hookResultsOut, struct hookd_encoded_fixup *fixups, int fixupsCount, int *fixupResultsOut)
 {
-	if (!hookd_send_msg) return -1;
+	if (!hookd_send_msg || hooksCount < 0 || fixupsCount < 0 ||
+		(hooksCount && !hookResultsOut) || (fixupsCount && !fixupResultsOut)) return -1;
 
 	int r = 0;
 
-	uint8_t msgBuf[HOOKD_MSG_MAX_SIZE];
+	_Alignas(struct hookd_mach_msg) uint8_t msgBuf[HOOKD_MSG_MAX_SIZE];
 	memset(msgBuf, 0, HOOKD_MSG_MAX_SIZE);
 	struct hookd_mach_msg *msg = (struct hookd_mach_msg *)msgBuf;
 	r = hookd_encode_msg(msg, getpid_inline(), taskPort, hooks, hooksCount, fixups, fixupsCount);
 	if (r != 0) return r;
 
-	uint8_t replyBuf[HOOKD_MSG_MAX_SIZE + MAX_TRAILER_SIZE];
+	_Alignas(struct hookd_mach_msg_reply) uint8_t replyBuf[HOOKD_MSG_MAX_SIZE + MAX_TRAILER_SIZE];
 	memset(replyBuf, 0, HOOKD_MSG_MAX_SIZE + MAX_TRAILER_SIZE);
 	struct hookd_mach_msg_reply *reply = (struct hookd_mach_msg_reply *)replyBuf;
 	reply->hdr.msgh_size = HOOKD_MSG_MAX_SIZE + MAX_TRAILER_SIZE;
 	r = hookd_send_msg(msg, reply);
 	if (r != 0) return r;
 
-	if (hookd_decode_reply(reply, hookResultsOut, fixupResultsOut) != 0) return -44;
+	if (hookd_decode_reply(reply, hooksCount, hookResultsOut, fixupsCount, fixupResultsOut) != 0) return -44;
 
 	return 0;
 }

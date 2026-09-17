@@ -3,6 +3,8 @@ import subprocess
 import tempfile
 import unittest
 
+from port_review_test_support import function_source
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -22,8 +24,7 @@ class CredentialServiceTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_parent_delegates_before_resuming(self):
-        source = (ROOT / "BaseBin/libjailbreak/src/util.c").read_text()
-        body = source.split("int target_proc_with_ucred(", 1)[1].split("\nint proc_ucred_update_content(", 1)[0]
+        body = function_source("BaseBin/libjailbreak/src/util.c", "target_proc_with_ucred_counted")
         self.assertIn("jbdPrepareCredentialHelper(pid, pidversion, deadline)", body)
         self.assertIn("int pidversion = proc_get_pidversion(pid);", body)
         self.assertNotIn("proc_patch_dyld(pid)", body)

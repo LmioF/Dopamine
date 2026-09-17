@@ -29,6 +29,23 @@ typedef struct {
     mach_msg_type_number_t saved_exception_types_count;
 } trace_data_t;
 
+static void release_process_trace(trace_data_t *trace_data)
+{
+    for (uint32_t i = 0; i < trace_data->saved_exception_types_count; ++i) {
+        if(MACH_PORT_VALID(trace_data->saved_ports[i])) {
+            mach_port_deallocate(mach_task_self(), trace_data->saved_ports[i]);
+        }
+    }
+
+    if (MACH_PORT_VALID(trace_data->task)) {
+        mach_port_deallocate(mach_task_self(), trace_data->task);
+        trace_data->task = MACH_PORT_NULL;
+    }
+
+    [trace_data_record removeObjectForKey:@(trace_data->pid)];
+    free((void*)trace_data);
+}
+
 static void finish_process_trace(trace_data_t* trace_data, bool success)
 {
     pid_t pid = trace_data->pid;
@@ -45,14 +62,7 @@ static void finish_process_trace(trace_data_t* trace_data, bool success)
         kill(pid, SIGKILL);
     }
 
-    for (uint32_t i = 0; i < trace_data->saved_exception_types_count; ++i) {
-        if(MACH_PORT_VALID(trace_data->saved_ports[i])) {
-            mach_port_deallocate(mach_task_self(), trace_data->saved_ports[i]);
-        }
-    }
-
-    [trace_data_record removeObjectForKey:@(pid)];
-    free((void*)trace_data);
+    release_process_trace(trace_data);
 }
 
 static void* exception_server(void* arg)
@@ -77,6 +87,7 @@ static void* exception_server(void* arg)
         __Request__mach_exception_raise_t *request = (__Request__mach_exception_raise_t*)msg;
 
         __Reply__mach_exception_raise_t reply = {0};
+        bool transferred_task_right = false;
 
         reply.NDR = request->NDR;
         reply.RetCode = KERN_SUCCESS;
@@ -86,16 +97,35 @@ static void* exception_server(void* arg)
         kern_return_t kr = pid_for_task(request->task.name, &pid);
         if(kr != KERN_SUCCESS || pid<=0) {
             JBLogError("pid_for_task (task=%x pid=%d) failed: %x, %s\n", request->task.name, pid, kr, mach_error_string(kr));
-            continue;
+            reply.RetCode = KERN_FAILURE;
+            goto send_reply;
         }
 
         arm_thread_state64_t threadState={0};
         mach_msg_type_number_t threadStateCount = ARM_THREAD_STATE64_COUNT;
-        thread_get_state(request->thread.name, ARM_THREAD_STATE64, (thread_state_t)&threadState, &threadStateCount);
+        kr = thread_get_state(request->thread.name, ARM_THREAD_STATE64, (thread_state_t)&threadState, &threadStateCount);
+        if (kr != KERN_SUCCESS) {
+            JBLogError("thread_get_state(thread) failed: %x, %s\n", kr, mach_error_string(kr));
+            reply.RetCode = KERN_FAILURE;
+            [trace_data_lock lock];
+            trace_data_t *failed_trace_data = (trace_data_t *)[[trace_data_record objectForKey:@(pid)] pointerValue];
+            if (failed_trace_data) finish_process_trace(failed_trace_data, false);
+            [trace_data_lock unlock];
+            goto send_reply;
+        }
 
         arm_exception_state64_t exceptionState;
         mach_msg_type_number_t exceptionStateCount = ARM_EXCEPTION_STATE64_COUNT;
-        thread_get_state(request->thread.name, ARM_EXCEPTION_STATE64, (thread_state_t)&exceptionState, &exceptionStateCount);
+        kr = thread_get_state(request->thread.name, ARM_EXCEPTION_STATE64, (thread_state_t)&exceptionState, &exceptionStateCount);
+        if (kr != KERN_SUCCESS) {
+            JBLogError("thread_get_state(exception) failed: %x, %s\n", kr, mach_error_string(kr));
+            reply.RetCode = KERN_FAILURE;
+            [trace_data_lock lock];
+            trace_data_t *failed_trace_data = (trace_data_t *)[[trace_data_record objectForKey:@(pid)] pointerValue];
+            if (failed_trace_data) finish_process_trace(failed_trace_data, false);
+            [trace_data_lock unlock];
+            goto send_reply;
+        }
         
         __darwin_arm_thread_state64_ptrauth_strip(threadState);
         uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(threadState);
@@ -109,19 +139,25 @@ static void* exception_server(void* arg)
 
         if(!trace_data) {
             JBLogError("no trace data for pid=%d, %s\n", pid, proc_get_path(pid,NULL));
+            reply.RetCode = KERN_FAILURE;
         }
         else if (request->exception == EXC_SOFTWARE && request->codeCnt == 2 && request->code[0] == EXC_SOFT_SIGNAL) 
         {
             JBLogDebug("exec* pid=%d cancelled=%d got signal: %d\n", pid, trace_data->cancelled, (int)request->code[1]);
 
-            trace_data->task = request->task.name;
-
             switch(request->code[1]) {
                 case SIGSTOP: {
+                    if (MACH_PORT_VALID(trace_data->task)) {
+                        mach_port_deallocate(mach_task_self(), trace_data->task);
+                    }
+                    trace_data->task = request->task.name;
+                    transferred_task_right = true;
+
                     bool data=true;
                     kern_return_t kr = vm_write(request->task.name, trace_data->traced_flag_addr, (mach_vm_address_t)&data, sizeof(data));
                     if(kr != KERN_SUCCESS) {
                         JBLogError("vm_write error: %x, %s\n", kr, mach_error_string(kr));
+                        reply.RetCode = KERN_FAILURE;
                         finish_process_trace(trace_data, false);
                         trace_data = NULL;
                         break;
@@ -130,6 +166,7 @@ static void* exception_server(void* arg)
                     int ret = ptrace(PT_CONTINUE, pid, (caddr_t)1, 0);
                     if(ret != 0) {
                         JBLogError("PT_CONTINUE error: %d, %s\n", errno, strerror(errno));
+                        reply.RetCode = KERN_FAILURE;
                         finish_process_trace(trace_data, false);
                         trace_data = NULL;
                         break;
@@ -147,6 +184,7 @@ static void* exception_server(void* arg)
                     {
                         if(roothide_patch_proc(pid) != 0) {
                             JBLogError("roothide_patch_proc failed for pid=%d, %s\n", pid, proc_get_path(pid,NULL));
+                            reply.RetCode = KERN_FAILURE;
                             finish_process_trace(trace_data, false);
                             trace_data = NULL;
                             break;
@@ -158,6 +196,7 @@ static void* exception_server(void* arg)
                         kern_return_t kr = vm_write(request->task.name, trace_data->detached_flag_addr, (mach_vm_address_t)&data, sizeof(data));
                         if(kr != KERN_SUCCESS) {
                             JBLogError("vm_write error: %x, %s\n", kr, mach_error_string(kr));
+                            reply.RetCode = KERN_FAILURE;
                             finish_process_trace(trace_data, false);
                             trace_data = NULL;
                             break;
@@ -176,6 +215,7 @@ static void* exception_server(void* arg)
                     }
 
                     if(exception_port_restore_failed) {
+                        reply.RetCode = KERN_FAILURE;
                         finish_process_trace(trace_data, false);
                         trace_data = NULL;
                         break;
@@ -184,6 +224,7 @@ static void* exception_server(void* arg)
                     int ret = ptrace(PT_DETACH, pid, NULL, 0);
                     if(ret != 0) {
                         JBLogError("PT_DETACH error: %d, %s\n", errno, strerror(errno));
+                        reply.RetCode = KERN_FAILURE;
                         finish_process_trace(trace_data, false);
                         trace_data = NULL;
                         break;
@@ -197,23 +238,33 @@ static void* exception_server(void* arg)
 
                 default:
                     JBLogError("unknown signal code: %d from %d,%s\n", (int)request->code[1], pid);
+                    reply.RetCode = KERN_FAILURE;
                     break;
             }
         } else {
             JBLogError("unexpected exception type: %d from %d,%s\n", request->exception, pid, proc_get_path(pid,NULL));
+            reply.RetCode = KERN_FAILURE;
         }
 
         trace_data = NULL;
         [trace_data_lock unlock];
 
-		reply.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg->msgh_bits), 0);
+	send_reply:
+			reply.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg->msgh_bits), 0);
 		reply.Head.msgh_size = sizeof(__Reply__mach_exception_raise_t);
 		reply.Head.msgh_remote_port = msg->msgh_remote_port;
 		reply.Head.msgh_local_port = MACH_PORT_NULL;
 		reply.Head.msgh_id = msg->msgh_id + 0x64;
 
-		mach_msg(&reply.Head, MACH_SEND_MSG | MACH_MSG_OPTION_NONE, reply.Head.msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-	}
+			mach_msg(&reply.Head, MACH_SEND_MSG | MACH_MSG_OPTION_NONE, reply.Head.msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+
+			if (MACH_PORT_VALID(request->thread.name)) {
+				mach_port_deallocate(mach_task_self(), request->thread.name);
+			}
+			if (!transferred_task_right && MACH_PORT_VALID(request->task.name)) {
+				mach_port_deallocate(mach_task_self(), request->task.name);
+			}
+		}
 }
 
 int execTraceProcess(pid_t pid, uint64_t traced)
@@ -251,6 +302,10 @@ int execTraceProcess(pid_t pid, uint64_t traced)
     int ret = 0;
     
     trace_data_t* trace_data = (trace_data_t*)malloc(sizeof(trace_data_t));
+    if (!trace_data) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -1;
+    }
     memset(trace_data, 0, sizeof(trace_data_t));
     trace_data->traced_flag_addr = traced;
     trace_data->pid = pid;
@@ -273,10 +328,21 @@ int execTraceProcess(pid_t pid, uint64_t traced)
 
             [trace_data_record setObject:[NSValue valueWithPointer:trace_data] forKey:@(pid)];
 
-            int ret = ptrace(PT_ATTACHEXC, pid, NULL, 0);
-            if(ret != 0) {
+            int attach_ret = ptrace(PT_ATTACHEXC, pid, NULL, 0);
+            if(attach_ret != 0) {
                 JBLogError("attach error: %d, %s", errno, strerror(errno));
                 [trace_data_record removeObjectForKey:@(pid)];
+
+                for (uint32_t i = 0; i < trace_data->saved_exception_types_count; ++i) {
+                    kern_return_t restore_kr = task_set_exception_ports(task, trace_data->saved_masks[i],
+                                                trace_data->saved_ports[i], trace_data->saved_behaviors[i], trace_data->saved_flavors[i]);
+                    if (restore_kr != KERN_SUCCESS) {
+                        JBLogError("task_set_exception_ports restore[%d] error: %x, %s", i, restore_kr, mach_error_string(restore_kr));
+                    }
+                    if (MACH_PORT_VALID(trace_data->saved_ports[i])) {
+                        mach_port_deallocate(mach_task_self(), trace_data->saved_ports[i]);
+                    }
+                }
                 free(trace_data);
                 ret = -1;
             }
@@ -285,11 +351,18 @@ int execTraceProcess(pid_t pid, uint64_t traced)
     
         } else {
             JBLogError("task_set_exception_ports error: %x, %s", kr, mach_error_string(kr));
+            for (uint32_t i = 0; i < trace_data->saved_exception_types_count; ++i) {
+                if (MACH_PORT_VALID(trace_data->saved_ports[i])) {
+                    mach_port_deallocate(mach_task_self(), trace_data->saved_ports[i]);
+                }
+            }
+            free(trace_data);
             ret = -1;
         }
     
     } else {
         JBLogError("task_get_exception_ports error: %x, %s", kr, mach_error_string(kr));
+        free(trace_data);
         ret = -1;
     }
 
@@ -307,6 +380,16 @@ int execTraceCancel(pid_t pid, uint64_t detached)
         trace_data->cancelled = true;
         trace_data->detached_flag_addr = detached;
         ret = kill(pid, SIGTRAP);
+        if (ret != 0) {
+            int signal_error = errno;
+            trace_data->cancelled = false;
+            trace_data->detached_flag_addr = 0;
+            if (signal_error == ESRCH) {
+                release_process_trace(trace_data);
+                trace_data = NULL;
+            }
+            errno = signal_error;
+        }
     } else {
         JBLogError("no trace data for pid=%d", pid);
     }

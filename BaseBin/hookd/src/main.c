@@ -6,6 +6,9 @@
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <unistd.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 mach_port_t extract_task_port(mach_port_t clientTaskPort, mach_port_t callerPort)
 {
@@ -31,6 +34,17 @@ mach_port_t extract_task_port(mach_port_t clientTaskPort, mach_port_t callerPort
 int apply_hook(mach_port_t clientTaskPort, mach_port_t taskPortInClient, vm_address_t vmaddr, const void *data, vm_size_t size)
 {
 	if (!data || size == 0) return -1;
+	if (vm_page_size == 0 || (vm_page_size & (vm_page_size - 1)) != 0) return KERN_INVALID_ARGUMENT;
+
+	vm_address_t maxAddress = ~(vm_address_t)0;
+	vm_address_t pageMask = (vm_address_t)vm_page_size - 1;
+	if ((vm_address_t)size > maxAddress - vmaddr) return KERN_INVALID_ADDRESS;
+	vm_address_t writeEnd = vmaddr + (vm_address_t)size;
+	if (writeEnd > maxAddress - pageMask) return KERN_INVALID_ADDRESS;
+	vm_address_t protectStart = vmaddr & ~pageMask;
+	vm_address_t protectEnd = (writeEnd + pageMask) & ~pageMask;
+	if (protectEnd <= protectStart) return KERN_INVALID_ADDRESS;
+	vm_size_t protectSize = protectEnd - protectStart;
 
 	mach_port_t taskPort = extract_task_port(clientTaskPort, taskPortInClient);
 	if (!MACH_PORT_VALID(taskPort)) {
@@ -49,11 +63,15 @@ int apply_hook(mach_port_t clientTaskPort, mach_port_t taskPortInClient, vm_addr
 	// Other target threads must not execute the page during its non-executable interval.
 	kr = task_suspend(taskPort);
 	if (kr != KERN_SUCCESS) goto release;
-	kr = vm_protect(taskPort, vmaddr, size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	kr = vm_protect(taskPort, protectStart, protectSize, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 	if (kr == KERN_SUCCESS) {
 		kr = vm_write(taskPort, vmaddr, (vm_offset_t)data, (mach_msg_type_number_t)size);
-		kern_return_t protectionResult = vm_protect(taskPort, vmaddr, size, false, VM_PROT_READ | VM_PROT_EXECUTE);
-		if (protectionResult != KERN_SUCCESS) kr = protectionResult;
+		kern_return_t protectionResult = vm_protect(taskPort, protectStart, protectSize, false, VM_PROT_READ | VM_PROT_EXECUTE);
+		if (protectionResult != KERN_SUCCESS) {
+			kern_return_t terminateResult = task_terminate(taskPort);
+			kr = terminateResult == KERN_SUCCESS ? protectionResult : terminateResult;
+			goto release;
+		}
 	}
 	kern_return_t resumeResult = task_resume(taskPort);
 	if (kr == KERN_SUCCESS) kr = resumeResult;
@@ -79,11 +97,13 @@ int apply_fixup(mach_port_t clientTaskPort, mach_port_t taskPortInClient, vm_add
 void server_loop(mach_port_t port)
 {
 	kern_return_t kr;
-	mach_msg_size_t buffer_size = 4096 + MAX_TRAILER_SIZE;
+	mach_msg_size_t buffer_size = HOOKD_MSG_MAX_SIZE + MAX_TRAILER_SIZE;
 	void *buffer = malloc(buffer_size);
+	if (!buffer) return;
 
 	while (true) {
 		struct hookd_mach_msg *msg = (struct hookd_mach_msg *)buffer;
+		struct hookd_mach_msg_reply *reply = NULL;
 		task_port_t clientTaskPort = MACH_PORT_NULL;
 
 		kr = mach_msg(
@@ -105,11 +125,14 @@ void server_loop(mach_port_t port)
 		// printf("Hookd received msg: ");
 		// __builtin_dump_struct(msg, printf);
 
-		if (msg->hdr.msgh_size < sizeof(struct hookd_mach_msg)) goto deny;
-
-		mach_msg_trailer_t *trailer = (mach_msg_trailer_t *)((uint8_t *)msg + msg->hdr.msgh_size);
+		if (msg->hdr.msgh_size < sizeof(*msg) || msg->hdr.msgh_size > HOOKD_MSG_MAX_SIZE ||
+			(msg->hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX)) goto deny;
+		size_t trailerOffset = (msg->hdr.msgh_size + sizeof(natural_t) - 1) & ~(sizeof(natural_t) - 1);
+		if (trailerOffset > buffer_size || sizeof(mach_msg_audit_trailer_t) > buffer_size - trailerOffset) goto deny;
+		mach_msg_trailer_t *trailer = (mach_msg_trailer_t *)((uint8_t *)msg + trailerOffset);
 		if (trailer->msgh_trailer_type != MACH_MSG_TRAILER_FORMAT_0 || 
-			trailer->msgh_trailer_size < sizeof(mach_msg_audit_trailer_t)) goto deny;
+			trailer->msgh_trailer_size < sizeof(mach_msg_audit_trailer_t) ||
+			trailer->msgh_trailer_size > buffer_size - trailerOffset) goto deny;
 
 		mach_msg_audit_trailer_t *auditTrailer = (mach_msg_audit_trailer_t *)trailer;
 		pid_t callerPid = audit_token_to_pid(auditTrailer->msgh_audit);
@@ -124,62 +147,54 @@ void server_loop(mach_port_t port)
 		if (msg->fixupsStartOff > dataSize) goto deny;
 		if (msg->hooksStartOff > msg->fixupsStartOff) goto deny;
 
-		kr = task_for_pid(mach_task_self(), msg->clientPid, &clientTaskPort);
-		if (kr != KERN_SUCCESS || !MACH_PORT_VALID(clientTaskPort)) {
-			// printf("task_for_pid(%d) failed (%d)\n", msg->clientPid, kr);
-			goto deny;
-		}
-
 		size_t hooksSize = msg->fixupsStartOff - msg->hooksStartOff;
 		size_t fixupsSize = dataSize - msg->fixupsStartOff;
 
 		uint8_t *hooksStart  = &msg->data[msg->hooksStartOff];
 		uint8_t *fixupsStart = &msg->data[msg->fixupsStartOff];
 
-		// Apply hooks
-		int64_t *hookResults = NULL;
-		uint32_t hookCount = 0;
-		if (hooksSize > 0) {
-			for (uint32_t idx = 0; idx < hooksSize;) {
-				struct hookd_encoded_hook *hook = (struct hookd_encoded_hook *)&hooksStart[idx];
-				uint32_t remainingBytes = hooksSize - idx;
-				uint32_t hookSize = sizeof(*hook) + hook->dataSize;
-				if (hookSize > remainingBytes) break;
-
-				hookCount++;
-				hookResults = realloc(hookResults, sizeof(int64_t) * hookCount);
-				hookResults[hookCount-1] = apply_hook(clientTaskPort, msg->taskPortInClient, hook->address, hook->data, hook->dataSize);
-				// printf("Hook %d (address=%#llx, data=%p, dataSize=%zu) => %lld\n", hookCount-1, hook->address, hook->data, hook->dataSize, hookResults[hookCount-1]);
-				idx += hookSize;
-			}
+		// A malformed tail or allocation refusal must not leave a partially executed batch.
+		size_t hookCount = 0;
+		for (size_t offset = 0; offset < hooksSize;) {
+			struct hookd_encoded_hook hook;
+			size_t remaining = hooksSize - offset;
+			if (remaining < sizeof(hook)) goto deny;
+			memcpy(&hook, hooksStart + offset, sizeof(hook));
+			if (!hook.dataSize || hook.dataSize > remaining - sizeof(hook)) goto deny;
+			offset += sizeof(hook) + hook.dataSize;
+			hookCount++;
 		}
-
-		// Apply fixups
-		int64_t *fixupResults = NULL;
-		uint32_t fixupCount = 0;
-		if ((fixupsSize > 0) && ((fixupsSize % sizeof(struct hookd_encoded_fixup)) == 0)) {
-			fixupCount = fixupsSize / sizeof(struct hookd_encoded_fixup);
-			fixupResults = malloc(fixupCount * sizeof(int64_t));
-
-			for (uint32_t idx = 0; idx < fixupCount; idx++) {
-				struct hookd_encoded_fixup *fixup = (struct hookd_encoded_fixup *)&fixupsStart[idx * sizeof(struct hookd_encoded_fixup)];
-				fixupResults[idx] = apply_fixup(clientTaskPort, msg->taskPortInClient, fixup->address, fixup->size, fixup->set_maximum, fixup->prot);
-				// printf("Fixup %d => %lld\n", idx, fixupResults[idx]);
-			}
-		}
-
-		size_t hookResultsSize  = hookCount * sizeof(int64_t);
-		size_t fixupResultsSize = fixupCount * sizeof(int64_t);
-
-		size_t replySize = sizeof(struct hookd_mach_msg_reply) + hookResultsSize + fixupResultsSize;
-		struct hookd_mach_msg_reply *reply = malloc(replySize);
-		reply->hdr.msgh_size = replySize;
-		
-		reply->hookResultsCount  = hookCount;
+		if (fixupsSize % sizeof(struct hookd_encoded_fixup)) goto deny;
+		size_t fixupCount = fixupsSize / sizeof(struct hookd_encoded_fixup);
+		size_t resultCapacity = (HOOKD_MSG_MAX_SIZE - sizeof(*reply)) / sizeof(int64_t);
+		if (hookCount > resultCapacity || fixupCount > resultCapacity - hookCount) goto deny;
+		size_t replySize = sizeof(*reply) + (hookCount + fixupCount) * sizeof(int64_t);
+		reply = malloc(replySize);
+		if (!reply) goto deny;
+		memset(reply, 0, replySize);
+		reply->hdr.msgh_size = (mach_msg_size_t)replySize;
+		reply->hookResultsCount = hookCount;
 		reply->fixupResultsCount = fixupCount;
 
-		if (hookResults)  { memcpy(&reply->data[0],               hookResults,  hookResultsSize);  free(hookResults); }
-		if (fixupResults) { memcpy(&reply->data[hookResultsSize], fixupResults, fixupResultsSize); free(fixupResults); }
+		kr = task_for_pid(mach_task_self(), msg->clientPid, &clientTaskPort);
+		if (kr != KERN_SUCCESS || !MACH_PORT_VALID(clientTaskPort)) goto deny;
+
+		size_t offset = 0;
+		for (size_t index = 0; index < hookCount; index++) {
+			struct hookd_encoded_hook hook;
+			memcpy(&hook, hooksStart + offset, sizeof(hook));
+			int64_t result = apply_hook(clientTaskPort, msg->taskPortInClient, hook.address,
+				hooksStart + offset + sizeof(hook), hook.dataSize);
+			memcpy(&reply->data[index * sizeof(result)], &result, sizeof(result));
+			offset += sizeof(hook) + hook.dataSize;
+		}
+		for (size_t index = 0; index < fixupCount; index++) {
+			struct hookd_encoded_fixup fixup;
+			memcpy(&fixup, fixupsStart + index * sizeof(fixup), sizeof(fixup));
+			int64_t result = apply_fixup(clientTaskPort, msg->taskPortInClient,
+				fixup.address, fixup.size, fixup.set_maximum, fixup.prot);
+			memcpy(&reply->data[(hookCount + index) * sizeof(result)], &result, sizeof(result));
+		}
 
 		int32_t bits = MACH_MSGH_BITS_REMOTE(msg->hdr.msgh_bits);
 		if (bits == MACH_MSG_TYPE_COPY_SEND) {
@@ -200,6 +215,7 @@ void server_loop(mach_port_t port)
 		}
 
 deny:
+		free(reply);
 		if (MACH_PORT_VALID(clientTaskPort)) {
 			mach_port_mod_refs(mach_task_self(), clientTaskPort, MACH_PORT_RIGHT_SEND, -1);
 		}

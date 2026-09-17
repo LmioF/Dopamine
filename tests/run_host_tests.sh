@@ -51,9 +51,10 @@ export DYLD_LIBRARY_PATH="$ROOT/BaseBin/XPF/output/macos${DYLD_LIBRARY_PATH:+:$D
     tests/trust_signatures_tests.m BaseBin/libjailbreak/src/signatures.c \
     BaseBin/libjailbreak/src/roothider/recdhash.m \
     BaseBin/libjailbreak/src/roothider/code_signing.c -o "$BUILD/trust_signatures_tests"
-for binary in killall dash; do
-    tar -xOf Application/Dopamine/Resources/bootstrap_1900.tar.zst "./usr/bin/$binary" > "$BUILD/trust-fixture-$binary"
-    "$BUILD/trust_signatures_tests" "$BUILD/trust-fixture-$binary" "$BUILD"
+for binary in usr/bin/killall usr/bin/dash usr/lib/pam/pam_unix.so; do
+    fixture="$BUILD/trust-fixture-$(basename "$binary")"
+    tar -xOf Application/Dopamine/Resources/bootstrap_1900.tar.zst "./$binary" > "$fixture"
+    "$BUILD/trust_signatures_tests" "$fixture" "$BUILD"
 done
 
 "$CC" -isysroot "$SDK" -fblocks -I"$BUILD/include" -IBaseBin/ChOma/include \

@@ -258,7 +258,7 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
 
 uint64_t IOSurface_kalloc_16up(uint64_t size, bool leak)
 {
-	if (size > 0x10000) return -1; // 0x10000 is max
+	if (size > 0x10000) return 0; // 0x10000 is max
 
 	while (true) {
 		mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up(size);

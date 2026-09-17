@@ -7,12 +7,14 @@
 
 #import "DOEnvironmentManager.h"
 #import "UIImage+JPEG2000.h"
+#import "NSString+Version.h"
 
 #import <sys/sysctl.h>
 #import <sys/mount.h>
 #import <sys/utsname.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <fcntl.h>
 #import <mach-o/dyld.h>
 #import <libgrabkernel2/libgrabkernel2.h>
 #import <libjailbreak/info.h>
@@ -377,73 +379,104 @@ extern char **environ;
 
 - (int)spawnJbctlAsRootWithArgs:(NSArray *)args
 {
-    bool needsLegacySolution = false;
-    if (self.jailbrokenVersion) {
-        needsLegacySolution = (strcmp(self.jailbrokenVersion.UTF8String, "3.0.5") < 0);
-    }
+    NSString *version = self.jailbrokenVersion;
+    bool needsLegacySolution = version && [version compareVersion:@"3.0.5"] == NSOrderedAscending;
+    if (args.count > SIZE_MAX / sizeof(char *) - 4) return EOVERFLOW;
 
-    char **argBuf = malloc((args.count + 4) * sizeof(char *));
-    argBuf[0] = strdup(JBROOT_PATH("/basebin/jbctl"));
-    int i = 1;
-    for (NSString *arg in args) {
-        argBuf[i++] = strdup(arg.UTF8String);
-    }
-
-    if (!needsLegacySolution) {
-        argBuf[i++] = strdup("--waitfor");
-        argBuf[i++] = strdup("3");
-    }
-    argBuf[i++] = NULL;
-    
+    __block int r = ENOMEM;
+    __block pid_t pid = -1;
+    bool shouldWait = false;
+    bool actionsInitialized = false;
+    bool attributesInitialized = false;
     posix_spawn_file_actions_t act = NULL;
-	posix_spawn_file_actions_init(&act);
     posix_spawnattr_t attr = NULL;
-    posix_spawnattr_init(&attr);
-     
-    int waitPipe[2];
-    
+    int waitPipe[2] = {-1, -1};
+    NSUInteger capacity = args.count + 4;
+    char **argBuf = calloc(capacity, sizeof(char *));
+    if (!argBuf) return ENOMEM;
+    NSUInteger i = 0;
+    if (!(argBuf[i++] = strdup(JBROOT_PATH("/basebin/jbctl")))) goto cleanup;
+    for (NSString *arg in args) {
+        if (![arg isKindOfClass:NSString.class]) { r = EINVAL; goto cleanup; }
+        if (!(argBuf[i++] = strdup(arg.UTF8String))) goto cleanup;
+    }
+
     if (!needsLegacySolution) {
-        pipe(waitPipe);
-        posix_spawn_file_actions_adddup2(&act, waitPipe[0], 3);
+        if (!(argBuf[i++] = strdup("--waitfor"))) goto cleanup;
+        if (!(argBuf[i++] = strdup("3"))) goto cleanup;
+    }
+
+    r = posix_spawn_file_actions_init(&act);
+    if (r) goto cleanup;
+    actionsInitialized = true;
+    r = posix_spawnattr_init(&attr);
+    if (r) goto cleanup;
+    attributesInitialized = true;
+
+    if (!needsLegacySolution) {
+        if (pipe(waitPipe) != 0) { r = errno; goto cleanup; }
+        if (fcntl(waitPipe[0], F_SETFD, FD_CLOEXEC) != 0 ||
+            fcntl(waitPipe[1], F_SETFD, FD_CLOEXEC) != 0 ||
+            fcntl(waitPipe[1], F_SETNOSIGPIPE, 1) != 0) { r = errno; goto cleanup; }
+        r = posix_spawn_file_actions_adddup2(&act, waitPipe[0], 3);
+        if (r) goto cleanup;
+        if (waitPipe[0] != 3) {
+            r = posix_spawn_file_actions_addclose(&act, waitPipe[0]);
+            if (r) goto cleanup;
+        }
+        if (waitPipe[1] != 3) {
+            r = posix_spawn_file_actions_addclose(&act, waitPipe[1]);
+            if (r) goto cleanup;
+        }
     }
     else {
-        posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+        r = posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+        if (r) goto cleanup;
     }
 
-    __block int pid = 0;
-    __block int r = -1;
-
-    [self runAsRoot:^{
-        [self runUnsandboxed:^{
-            r = posix_spawn(&pid, argBuf[0], &act, &attr, (char *const *)argBuf, (char *const *)environ);
-            if (needsLegacySolution) {
-                // Legacy solution is a gamble, which is why it was removed and superseeded by --waitfor
-                // But if jailbroken with <3.0.5, jbctl doesn't support --waitfor yet
-                kill(pid, SIGCONT);
-            }
+    r = EPERM;
+    {
+        [self runAsRoot:^{
+            [self runUnsandboxed:^{
+                r = posix_spawn(&pid, argBuf[0], &act, &attr, (char *const *)argBuf, (char *const *)environ);
+            }];
         }];
-        // We *NEED* to leave this block on iOS 17+ to avoid a panic, --waitfor ensures this always happens
-    }];
-
-    posix_spawnattr_destroy(&attr);
-    posix_spawn_file_actions_destroy(&act);
-    for (int y = 0; y < i; y++) {
-        free(argBuf[y]);
     }
-    free(argBuf);
+    if (r) goto cleanup;
+    if (pid <= 0) { r = ECHILD; goto cleanup; }
 
-    if (!needsLegacySolution) {
-        if (r == 0) {
-            // We left the root/unsandbox block, now resume jbctl by writing to pipe
-            char w = 'w';
-            write(waitPipe[1], &w, sizeof(w));
+    // Neither release mechanism may run while the parent's temporary credentials are live.
+    if (needsLegacySolution) {
+        if (kill(pid, SIGCONT) != 0) {
+            r = errno;
+            shouldWait = kill(pid, SIGKILL) == 0 || errno == ESRCH;
         }
-
-        close(waitPipe[0]);
-        close(waitPipe[1]);
+        else {
+            shouldWait = true;
+        }
+    }
+    else {
+        char marker = 'w';
+        ssize_t written;
+        do {
+            written = write(waitPipe[1], &marker, sizeof(marker));
+        } while (written < 0 && errno == EINTR);
+        if (written != (ssize_t)sizeof(marker)) r = written < 0 ? errno : EIO;
+        shouldWait = true;
     }
 
-    return cmd_wait_for_exit(pid);
+cleanup:
+    if (waitPipe[0] >= 0) close(waitPipe[0]);
+    if (waitPipe[1] >= 0) close(waitPipe[1]);
+    if (attributesInitialized) posix_spawnattr_destroy(&attr);
+    if (actionsInitialized) posix_spawn_file_actions_destroy(&act);
+    for (NSUInteger y = 0; y < capacity; y++) free(argBuf[y]);
+    free(argBuf);
+    if (shouldWait) {
+        int childResult = cmd_wait_for_exit(pid);
+        if (!r) r = childResult;
+    }
+    return r;
 }
 
 - (int)runTrollStoreAction:(NSString *)action

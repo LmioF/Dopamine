@@ -51,15 +51,25 @@ int jbupdate_basebin(const char *basebinTarPath)
 		}
 
 		// Replace basebin content
-		NSArray *newBasebinContents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpBasebinPath error:nil];
-		for (NSString *basebinItem in newBasebinContents) {
-			NSString *newBasebinPath = [tmpBasebinPath stringByAppendingPathComponent:basebinItem];
-			NSString *oldBasebinPath = [JBROOT_PATH(@"/basebin") stringByAppendingPathComponent:basebinItem];
-			if ([[NSFileManager defaultManager] fileExistsAtPath:oldBasebinPath]) {
-				[[NSFileManager defaultManager] removeItemAtPath:oldBasebinPath error:nil];
+			NSArray *newBasebinContents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpBasebinPath error:nil];
+			if (!newBasebinContents) {
+				[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
+				return 6;
 			}
-			[[NSFileManager defaultManager] copyItemAtPath:newBasebinPath toPath:oldBasebinPath error:nil];
-		}
+			for (NSString *basebinItem in newBasebinContents) {
+				NSString *newBasebinPath = [tmpBasebinPath stringByAppendingPathComponent:basebinItem];
+				NSString *oldBasebinPath = [JBROOT_PATH(@"/basebin") stringByAppendingPathComponent:basebinItem];
+				if ([[NSFileManager defaultManager] fileExistsAtPath:oldBasebinPath]) {
+					if (![[NSFileManager defaultManager] removeItemAtPath:oldBasebinPath error:nil]) {
+						[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
+						return 7;
+					}
+				}
+				if (![[NSFileManager defaultManager] copyItemAtPath:newBasebinPath toPath:oldBasebinPath error:nil]) {
+					[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
+					return 8;
+				}
+			}
 		[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
 
 		// Patch basebin plists
@@ -84,7 +94,7 @@ int jbupdate_basebin(const char *basebinTarPath)
 		}
 
 		NSString *newVersion = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil];
-		if (!newVersion) return 6;
+			if (!newVersion) return 9;
 
 		setenv("JBUPDATE_PREV_VERSION", prevVersion.UTF8String, 1);
 		setenv("JBUPDATE_NEW_VERSION", newVersion.UTF8String, 1);
@@ -151,18 +161,7 @@ void jbupdate_update_system_info(void)
 			if (xpf_set_is_supported("perfkrw")) {
 				sets[idx++] = "perfkrw";
 			}
-
-
-/********************** roothide *************************/
-sets[idx++] = "namecache";
-
-if (xpf_set_is_supported("amfi_oids")) {
-	sets[idx++] = "amfi_oids";
-}
-
-sets[idx] = NULL;
-/********************** roothide *************************/
-
+				sets[idx] = NULL;
 
 			newSystemInfoXdict = xpf_construct_offset_dictionary((const char **)sets);
 			if (!newSystemInfoXdict) {
@@ -184,7 +183,7 @@ sets[idx] = NULL;
 
 		dlclose(xpfHandle);
 
-		// Get old info and merge new info into it
+		// The kernel has not changed: retain boot-resolved roothide fields absent from upstream XPF.
 		xpc_object_t systemInfoXdict = jbinfo_get_serialized();
 		xpc_dictionary_apply(newSystemInfoXdict, ^_Bool(const char *key, xpc_object_t xobj) {
 			xpc_dictionary_set_value(systemInfoXdict, key, xobj);

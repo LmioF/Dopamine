@@ -61,11 +61,17 @@ int main(int argc, char* argv[])
 	mach_port_deallocate(mach_task_self(), launchdTaskPort);
 
 	// Retrieve primitives
-	jbclient_initialize_primitives_internal(false);
-	roothide_bootlog("boomerang: primitive acquisition returned");
+		if (jbclient_initialize_primitives_internal(false) != 0) {
+			roothide_bootlog("boomerang: primitive acquisition failed");
+			return -1;
+		}
+		roothide_bootlog("boomerang: primitive acquisition returned");
 
-	// Send done message to launchd
-	jbclient_boomerang_done();
+		// Send done message to launchd
+		if (jbclient_boomerang_done() != 0) {
+			roothide_bootlog("boomerang: transfer completion failed");
+			return -1;
+		}
 	roothide_bootlog("boomerang: transfer completion sent");
 
 
