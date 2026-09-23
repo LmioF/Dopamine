@@ -1,3 +1,18 @@
+# Dopamine 云编 workflow（含 PR #1000：BaseBin/systemhook 导出 jb_get_memory_hooks）
+#
+# 这是 devnoname120/Dopamine@feat/frida-memory-hooks 里 .github/workflows/main.yml 的
+# 副本，唯一改动 = 最后的 Upload Artifact 步骤，额外导出 BaseBin/basebin.tar 与 .tipa，
+# 以便走「只更新 basebin，不重装整个 .ipa」的轻量部署（jbctl update basebin）。
+#
+# 用法：
+#   1. Fork devnoname120/Dopamine（fork 会带上所有分支）。
+#   2. 在 fork 里把本文件覆盖 .github/workflows/main.yml（分支 feat/frida-memory-hooks）。
+#   3. Actions 页 → "Dopamine: build and upload" → Run workflow，选 feat/frida-memory-hooks 分支。
+#   4. 跑完在 Artifacts 下载 Dopamine（含 Dopamine.ipa/.tipa + basebin.tar）。
+#
+# 说明：#1000 的改动全部在 BaseBin（systemhook + libjailbreak），因此 basebin.tar
+#       就包含导出 jb_get_memory_hooks 的新 systemhook.dylib。
+
 name: "Dopamine: build and upload"
 
 on:
@@ -12,12 +27,6 @@ on:
     paths-ignore:
       - ".gitignore"
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 1 1 *'
-    - cron: '0 0 1 4 *'
-    - cron: '0 0 30 6 *'
-    - cron: '0 0 28 9 *'
-    - cron: '0 0 27 12 *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -104,5 +113,9 @@ jobs:
         uses: actions/upload-artifact@main
         with:
           name: Dopamine
+          # 原 workflow 只上传 Dopamine.ipa；这里额外导出 basebin.tar（轻量部署）与 .tipa
           path: |
             ${{ github.workspace }}/Application/Dopamine.ipa
+            ${{ github.workspace }}/Application/Dopamine.tipa
+            ${{ github.workspace }}/BaseBin/basebin.tar
+          if-no-files-found: warn
